@@ -1,0 +1,39 @@
+{
+  "scriptCompleted": true,
+  "stats": {
+    "filesScanned": 21,
+    "filesWithImports": 4,
+    "totalEdges": 4
+  },
+  "importMap": {
+    ".understand-anything/.understandignore": [],
+    "backend/.env": [],
+    "backend/backend/data/scene.json": [],
+    "backend/main.py": [
+      "backend/simulation/traffic_engine.py"
+    ],
+    "backend/osm_loader.py": [],
+    "backend/requirements.txt": [],
+    "backend/simulation/live_traffic.py": [],
+    "backend/simulation/traffic_engine.py": [
+      "backend/simulation/weather.py"
+    ],
+    "backend/simulation/weather.py": [],
+    "frontend/AGENTS.md": [],
+    "frontend/CLAUDE.md": [],
+    "frontend/eslint.config.mjs": [],
+    "frontend/next.config.ts": [],
+    "frontend/package.json": [],
+    "frontend/postcss.config.mjs": [],
+    "frontend/README.md": [],
+    "frontend/src/app/globals.css": [],
+    "frontend/src/app/layout.tsx": [
+      "frontend/src/app/globals.css"
+    ],
+    "frontend/src/app/page.tsx": [
+      "frontend/src/components/Scene3D/CityViewer.tsx"
+    ],
+    "frontend/src/components/Scene3D/CityViewer.tsx": [],
+    "frontend/tsconfig.json": []
+  }
+}
