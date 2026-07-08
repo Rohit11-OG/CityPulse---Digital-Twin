@@ -535,19 +535,55 @@ export default function CityViewer() {
       scene.add(windowsMesh);
     };
 
-    // ─── Roads: merged dark ribbons + dashed centerlines ───
+    // ─── Roads: merged dark ribbons + dashed centerlines + elevated flyovers ───
+    const DECK_HEIGHT = 8.0; // must match backend TrafficSimulation.DECK_HEIGHT
+    const isElevated = (r: Road) => (r.layer ?? 0) > 0 || !!r.bridge;
+
     const createRoads = (roads: Road[]) => {
       const ribbonGeoms: THREE.BufferGeometry[] = [];
       const dashGeoms: THREE.BufferGeometry[] = [];
+      const pillarGeoms: THREE.BufferGeometry[] = [];
+
+      // Nodes shared with ground roads are ramp ends — deck descends to 0 there
+      const groundKeys = new Set<string>();
+      roads.forEach((r) => {
+        if (!isElevated(r)) r.coordinates?.forEach((p) => groundKeys.add(`${p.x},${p.y}`));
+      });
 
       roads.forEach((road) => {
         if (!road.coordinates || road.coordinates.length < 2) return;
         const pts = road.coordinates.map((p) => new THREE.Vector2(p.x, -p.y));
         const width = roadWidth(road);
-        const geo = buildRibbon(pts, width, 0.12);
+        const elevated = isElevated(road);
+        const heights = road.coordinates.map((p) =>
+          elevated && !groundKeys.has(`${p.x},${p.y}`) ? DECK_HEIGHT + 0.12 : 0.12
+        );
+        const geo = buildRibbon(pts, width, elevated ? heights : 0.12);
         if (geo) ribbonGeoms.push(geo);
 
-        // Dashed centerline for multi-lane roads
+        // Support pillars under elevated deck sections
+        if (elevated) {
+          let acc = 0;
+          for (let i = 0; i < pts.length - 1; i++) {
+            const a = pts[i], b = pts[i + 1];
+            const segLen = a.distanceTo(b);
+            const dir = new THREE.Vector2().subVectors(b, a).normalize();
+            let d = 25 - acc;
+            while (d < segLen) {
+              const t = d / segLen;
+              const h = heights[i] + (heights[i + 1] - heights[i]) * t;
+              if (h > 4.5) {
+                const pillar = new THREE.CylinderGeometry(1.1, 1.3, h, 10);
+                pillar.translate(a.x + dir.x * d, h / 2, a.y + dir.y * d);
+                pillarGeoms.push(pillar);
+              }
+              d += 25;
+            }
+            acc = (acc + segLen) % 25;
+          }
+        }
+
+        // Dashed centerline for multi-lane roads (follows deck height)
         if (width >= 6.5) {
           let acc = 0;
           for (let i = 0; i < pts.length - 1; i++) {
@@ -558,10 +594,13 @@ export default function CityViewer() {
             while (d < segLen) {
               const cx = a.x + dir.x * d;
               const cz = a.y + dir.y * d;
+              const hy = elevated
+                ? heights[i] + (heights[i + 1] - heights[i]) * (d / segLen) + 0.04
+                : 0.16;
               const dash = new THREE.PlaneGeometry(3.0, 0.35);
               dash.rotateX(-Math.PI / 2);
               dash.rotateY(-Math.atan2(dir.y, dir.x));
-              dash.translate(cx, 0.16, cz);
+              dash.translate(cx, hy, cz);
               dashGeoms.push(dash);
               d += 7;
             }
@@ -569,6 +608,14 @@ export default function CityViewer() {
           }
         }
       });
+
+      if (pillarGeoms.length) {
+        const merged = BufferGeometryUtils.mergeGeometries(pillarGeoms);
+        const mat = new THREE.MeshStandardMaterial({ color: PALETTE.clayEdge, roughness: 0.9 });
+        const mesh = new THREE.Mesh(merged, mat);
+        mesh.castShadow = true;
+        scene.add(mesh);
+      }
 
       if (ribbonGeoms.length) {
         const merged = BufferGeometryUtils.mergeGeometries(ribbonGeoms);
