@@ -1,0 +1,24 @@
+# Secrets — never commit API keys
+.env
+*.env
+!*.env.example
+
+# Python
+backend/.venv/
+__pycache__/
+*.pyc
+
+# Generated map data
+backend/data/
+
+# Node / Next.js
+node_modules/
+frontend/.next/
+frontend/out/
+frontend/tsconfig.tsbuildinfo
+frontend/next-env.d.ts
+
+# Media / misc
+*.mp4
+.understand-anything/
+.DS_Store
