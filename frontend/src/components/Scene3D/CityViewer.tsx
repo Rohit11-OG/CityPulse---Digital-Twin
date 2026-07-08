@@ -174,32 +174,63 @@ function distSqToSegment(px: number, py: number, ax: number, ay: number, bx: num
 
 /** Drops buildings whose centroid falls inside a road ribbon (bad OSM overlaps). */
 function filterBuildingsOffRoads(buildings: Building[], roads: Road[]): Building[] {
-  const segs: { ax: number; ay: number; bx: number; by: number; half: number }[] = [];
+  type Seg = { ax: number; ay: number; bx: number; by: number; half: number };
+  const groundSegs: Seg[] = [];
+  const deckSegs: Seg[] = []; // elevated corridor footprint
   roads.forEach((r) => {
     if (!r.coordinates || r.coordinates.length < 2) return;
+    const elevated = (r.layer ?? 0) > 0 || !!r.bridge;
     const half = roadWidth(r) / 2 + 1.0;
+    const list = elevated ? deckSegs : groundSegs;
     for (let i = 0; i < r.coordinates.length - 1; i++) {
-      segs.push({
+      list.push({
         ax: r.coordinates[i].x, ay: r.coordinates[i].y,
         bx: r.coordinates[i + 1].x, by: r.coordinates[i + 1].y, half,
       });
     }
   });
-  const insideAnyRoad = (x: number, y: number) => {
+  // Depth of intrusion into a road ribbon: 0 = outside, 1 = on the centerline
+  const depthIn = (segs: Seg[], x: number, y: number) => {
+    let depth = 0;
     for (const s of segs) {
-      if (distSqToSegment(x, y, s.ax, s.ay, s.bx, s.by) < s.half * s.half) return true;
+      const d2 = distSqToSegment(x, y, s.ax, s.ay, s.bx, s.by);
+      if (d2 < s.half * s.half) {
+        depth = Math.max(depth, 1 - Math.sqrt(d2) / s.half);
+        if (depth > 0.99) break;
+      }
     }
-    return false;
+    return depth;
   };
+
+  const DECK_CLEARANCE = 6; // buildings taller than this would pierce the deck
 
   return buildings.filter((b) => {
     if (!b.coordinates || b.coordinates.length < 3) return false;
+    // Under the flyover only low structures survive; tall ones poke through the deck
+    const cullDeck = b.height > DECK_CLEARANCE;
     const c = polygonCentroid(b.coordinates);
-    if (insideAnyRoad(c.x, c.y)) return false;
-    // Footprints that straddle a road: too many vertices inside the ribbon
-    let inside = 0;
-    for (const p of b.coordinates) { if (insideAnyRoad(p.x, p.y)) inside++; }
-    return inside / b.coordinates.length < 0.3;
+    if (depthIn(groundSegs, c.x, c.y) > 0) return false;
+    if (cullDeck && depthIn(deckSegs, c.x, c.y) > 0) return false;
+
+    // Sample along the footprint outline (~every 6m), not just its vertices —
+    // a footprint can straddle a road with every vertex outside the ribbon
+    let samples = 0, inside = 0;
+    const n = b.coordinates.length;
+    for (let i = 0; i < n; i++) {
+      const p = b.coordinates[i], q = b.coordinates[(i + 1) % n];
+      const len = Math.hypot(q.x - p.x, q.y - p.y);
+      const steps = Math.max(1, Math.ceil(len / 6));
+      for (let k = 0; k < steps; k++) {
+        const t = k / steps;
+        const x = p.x + (q.x - p.x) * t, y = p.y + (q.y - p.y) * t;
+        const depth = depthIn(groundSegs, x, y);
+        samples++;
+        if (depth > 0) inside++;
+        if (depth > 0.25) return false; // outline reaches the carriageway
+        if (cullDeck && depthIn(deckSegs, x, y) > 0.25) return false;
+      }
+    }
+    return inside / samples < 0.25; // mostly-on-road footprints
   });
 }
 
@@ -1093,16 +1124,16 @@ export default function CityViewer() {
           activeIds.add(v.id);
           const ox = v.x - Math.sin(v.angle) * LANE_OFFSET;
           const oy = v.y + Math.cos(v.angle) * LANE_OFFSET;
-          const tx = ox, tz = -oy, ta = v.angle;
+          const tx = ox, ty = v.z ?? 0, tz = -oy, ta = v.angle;
           const existing = vMap.get(v.id);
           if (existing) {
-            existing.targetX = tx; existing.targetZ = tz;
+            existing.targetX = tx; existing.targetY = ty; existing.targetZ = tz;
             existing.targetAngle = ta; existing.speed = v.speed;
           } else {
             vMap.set(v.id, {
               id: v.id, type: v.type, speed: v.speed,
-              currentX: tx, currentZ: tz, currentAngle: ta,
-              targetX: tx, targetZ: tz, targetAngle: ta,
+              currentX: tx, currentY: ty, currentZ: tz, currentAngle: ta,
+              targetX: tx, targetY: ty, targetZ: tz, targetAngle: ta,
             });
           }
         });
@@ -1266,13 +1297,14 @@ export default function CityViewer() {
         if (idx >= MAX_INSTANCES) return;
 
         v.currentX += (v.targetX - v.currentX) * lerpF;
+        v.currentY += (v.targetY - v.currentY) * lerpF;
         v.currentZ += (v.targetZ - v.currentZ) * lerpF;
         let dA = v.targetAngle - v.currentAngle;
         while (dA > Math.PI) dA -= Math.PI * 2;
         while (dA < -Math.PI) dA += Math.PI * 2;
         v.currentAngle += dA * lerpF;
 
-        dummy.position.set(v.currentX, 0, v.currentZ);
+        dummy.position.set(v.currentX, v.currentY, v.currentZ);
         dummy.rotation.set(0, v.currentAngle, 0);
         dummy.scale.set(1, 1, 1);
         dummy.updateMatrix();
