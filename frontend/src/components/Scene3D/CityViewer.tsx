@@ -5,235 +5,17 @@ import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import * as BufferGeometryUtils from "three/examples/jsm/utils/BufferGeometryUtils.js";
 import { io, Socket } from "socket.io-client";
+import { LineChart, Line, YAxis } from "recharts";
 
-// ═══════════════════════════════════════════════════════
-// TYPE DEFINITIONS
-// ═══════════════════════════════════════════════════════
-
-interface NodeCoord { x: number; y: number; }
-
-interface Building {
-  id: number; coordinates: NodeCoord[]; height: number; type: string;
-}
-
-interface Road {
-  id: number; coordinates: NodeCoord[]; type: string; name: string; lanes: number;
-  junction?: string; layer?: number; bridge?: boolean;
-}
-
-interface Green {
-  id: number; coordinates: NodeCoord[]; kind: string; name: string;
-}
-
-interface Landmark { name: string; kind: string; x: number; y: number; }
-
-interface SceneData {
-  roads: Road[]; buildings: Building[]; greens?: Green[]; trees?: NodeCoord[]; landmarks?: Landmark[];
-}
-
-interface SocketVehicle {
-  id: number; x: number; y: number; z?: number; angle: number; type: string; speed: number;
-}
-
-interface TrafficLightData { x: number; y: number; state: string; }
-
-interface ClientVehicle {
-  id: number; type: string; speed: number;
-  currentX: number; currentY: number; currentZ: number; currentAngle: number;
-  targetX: number; targetY: number; targetZ: number; targetAngle: number;
-}
-
-interface Metrics {
-  health: number; avg_delay_s: number; junction_flow: number;
-  queued_m: number; idle_co2_kg_h: number; idle_fuel_l_h: number;
-  calibration_dev_pct?: number | null;
-}
-
-type VehicleType = "car" | "bus" | "auto" | "bike" | "truck";
-
-// ═══════════════════════════════════════════════════════
-// VISUAL CONSTANTS — clay-render palette from reference
-// ═══════════════════════════════════════════════════════
-
-const PALETTE = {
-  skyDay: 0xe3e6ea,
-  ground: 0xd8d5cc,
-  groundNight: 0x17181f,
-  clay: 0xf4f2ec,
-  clayNight: 0x97824c,
-  clayEdge: 0xb8b3a6,
-  clayEdgeNight: 0x1a1916,
-  glass: 0x9db1c4,
-  glassNight: 0x252c3c,
-  asphalt: 0x3c3f45,
-  asphaltNight: 0x191b20,
-  grass: 0x83b45c,
-  grassNight: 0x1c2b18,
-  path: 0xd9c9a4,
-  window: 0xffb75e,
-};
-
-// Slightly over-scaled (~1.2x) so traffic reads clearly from orbit height
-const VEHICLE_DIMS: Record<VehicleType, { w: number; h: number; l: number }> = {
-  car: { w: 2.4, h: 1.8, l: 5.3 },
-  bus: { w: 3.1, h: 4.1, l: 13.2 },
-  auto: { w: 2.0, h: 2.4, l: 3.6 },
-  bike: { w: 1.1, h: 1.9, l: 2.4 },
-  truck: { w: 3.0, h: 3.8, l: 9.0 },
-};
-
-const VEHICLE_COLORS: Record<VehicleType, string[]> = {
-  car: ["#f5f5f2", "#d9dde2", "#2f3640", "#e8c02a", "#b4372c", "#e9e4d6", "#8a9199", "#f5f5f2"],
-  bus: ["#e0721f", "#e0721f", "#2e8b57", "#d95f18"],
-  auto: ["#f2c12e", "#f2c12e", "#e8b400"],
-  bike: ["#33383f", "#4a4f57"],
-  truck: ["#3a7d44", "#5a6268", "#7a4f2a"],
-};
-
-const fmt = (n: number) => Math.round(n).toLocaleString("en-US");
-
-// Backend origin for REST + websocket; override with NEXT_PUBLIC_BACKEND_URL
-const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://127.0.0.1:8000";
-
-// ═══════════════════════════════════════════════════════
-// GEOMETRY HELPERS
-// ═══════════════════════════════════════════════════════
-
-/** Flat road ribbon from a polyline (XZ plane, three.js coords).
- *  `y` may be a per-point height array (flyover ramps) or a constant. */
-function buildRibbon(pts: THREE.Vector2[], width: number, y: number | number[]): THREE.BufferGeometry | null {
-  if (pts.length < 2) return null;
-  const half = width / 2;
-  const positions: number[] = [];
-  const indices: number[] = [];
-
-  const dirs: THREE.Vector2[] = [];
-  for (let i = 0; i < pts.length - 1; i++) {
-    dirs.push(new THREE.Vector2().subVectors(pts[i + 1], pts[i]).normalize());
-  }
-
-  for (let i = 0; i < pts.length; i++) {
-    const d = i === 0 ? dirs[0] : i === pts.length - 1 ? dirs[i - 1] : new THREE.Vector2().addVectors(dirs[i - 1], dirs[i]).normalize();
-    // Perpendicular in XZ plane
-    const nx = -d.y, nz = d.x;
-    const py = Array.isArray(y) ? y[i] : y;
-    positions.push(pts[i].x + nx * half, py, pts[i].y + nz * half);
-    positions.push(pts[i].x - nx * half, py, pts[i].y - nz * half);
-    if (i > 0) {
-      const a = (i - 1) * 2;
-      indices.push(a, a + 2, a + 1, a + 1, a + 2, a + 3);
-    }
-  }
-
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
-  geo.setIndex(indices);
-  geo.computeVertexNormals();
-  return geo;
-}
-
-/** Point-in-polygon (sim coords x,y). */
-function pointInPolygon(x: number, y: number, poly: NodeCoord[]): boolean {
-  let inside = false;
-  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
-    const xi = poly[i].x, yi = poly[i].y, xj = poly[j].x, yj = poly[j].y;
-    if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
-  }
-  return inside;
-}
-
-function polygonArea(poly: NodeCoord[]): number {
-  let a = 0;
-  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
-    a += poly[j].x * poly[i].y - poly[i].x * poly[j].y;
-  }
-  return a / 2;
-}
-
-function polygonCentroid(poly: NodeCoord[]): NodeCoord {
-  let cx = 0, cy = 0;
-  poly.forEach((p) => { cx += p.x; cy += p.y; });
-  return { x: cx / poly.length, y: cy / poly.length };
-}
-
-/** Rendered ribbon width for a road (metres). */
-function roadWidth(road: Road): number {
-  if (["service", "residential", "unclassified", "living_street"].includes(road.type)) return 4.5;
-  if (road.type === "tertiary") return 7;
-  return Math.max(road.lanes, 2) * 3.2 + 1.0;
-}
-
-/** Squared distance from point to segment (sim coords). */
-function distSqToSegment(px: number, py: number, ax: number, ay: number, bx: number, by: number): number {
-  const abx = bx - ax, aby = by - ay;
-  const len2 = abx * abx + aby * aby;
-  let t = len2 > 0 ? ((px - ax) * abx + (py - ay) * aby) / len2 : 0;
-  t = Math.max(0, Math.min(1, t));
-  const dx = px - (ax + abx * t), dy = py - (ay + aby * t);
-  return dx * dx + dy * dy;
-}
-
-/** Drops buildings whose centroid falls inside a road ribbon (bad OSM overlaps). */
-function filterBuildingsOffRoads(buildings: Building[], roads: Road[]): Building[] {
-  type Seg = { ax: number; ay: number; bx: number; by: number; half: number };
-  const groundSegs: Seg[] = [];
-  const deckSegs: Seg[] = []; // elevated corridor footprint
-  roads.forEach((r) => {
-    if (!r.coordinates || r.coordinates.length < 2) return;
-    const elevated = (r.layer ?? 0) > 0 || !!r.bridge;
-    const half = roadWidth(r) / 2 + 1.0;
-    const list = elevated ? deckSegs : groundSegs;
-    for (let i = 0; i < r.coordinates.length - 1; i++) {
-      list.push({
-        ax: r.coordinates[i].x, ay: r.coordinates[i].y,
-        bx: r.coordinates[i + 1].x, by: r.coordinates[i + 1].y, half,
-      });
-    }
-  });
-  // Depth of intrusion into a road ribbon: 0 = outside, 1 = on the centerline
-  const depthIn = (segs: Seg[], x: number, y: number) => {
-    let depth = 0;
-    for (const s of segs) {
-      const d2 = distSqToSegment(x, y, s.ax, s.ay, s.bx, s.by);
-      if (d2 < s.half * s.half) {
-        depth = Math.max(depth, 1 - Math.sqrt(d2) / s.half);
-        if (depth > 0.99) break;
-      }
-    }
-    return depth;
-  };
-
-  const DECK_CLEARANCE = 6; // buildings taller than this would pierce the deck
-
-  return buildings.filter((b) => {
-    if (!b.coordinates || b.coordinates.length < 3) return false;
-    // Under the flyover only low structures survive; tall ones poke through the deck
-    const cullDeck = b.height > DECK_CLEARANCE;
-    const c = polygonCentroid(b.coordinates);
-    if (depthIn(groundSegs, c.x, c.y) > 0) return false;
-    if (cullDeck && depthIn(deckSegs, c.x, c.y) > 0) return false;
-
-    // Sample along the footprint outline (~every 6m), not just its vertices —
-    // a footprint can straddle a road with every vertex outside the ribbon
-    let samples = 0, inside = 0;
-    const n = b.coordinates.length;
-    for (let i = 0; i < n; i++) {
-      const p = b.coordinates[i], q = b.coordinates[(i + 1) % n];
-      const len = Math.hypot(q.x - p.x, q.y - p.y);
-      const steps = Math.max(1, Math.ceil(len / 6));
-      for (let k = 0; k < steps; k++) {
-        const t = k / steps;
-        const x = p.x + (q.x - p.x) * t, y = p.y + (q.y - p.y) * t;
-        const depth = depthIn(groundSegs, x, y);
-        samples++;
-        if (depth > 0) inside++;
-        if (depth > 0.25) return false; // outline reaches the carriageway
-        if (cullDeck && depthIn(deckSegs, x, y) > 0.25) return false;
-      }
-    }
-    return inside / samples < 0.25; // mostly-on-road footprints
-  });
-}
+import type {
+  SceneData, Road, Building, Green, SocketVehicle, TrafficLightData,
+  ClientVehicle, Metrics, VehicleType,
+} from "./types";
+import { PALETTE, VEHICLE_DIMS, VEHICLE_COLORS, fmt, BACKEND_URL } from "./palette";
+import {
+  buildRibbon, offsetPolyline, pointInPolygon, polygonArea, polygonCentroid,
+  roadWidth, distSqToSegment, filterBuildingsOffRoads,
+} from "./geometry";
 
 // ═══════════════════════════════════════════════════════
 // MAIN COMPONENT
@@ -251,6 +33,10 @@ export default function CityViewer() {
   const [idleDelta, setIdleDelta] = useState<number>(0);
   const idlePrevRef = useRef<{ t: number; v: number }>({ t: 0, v: 0 });
   const [liveTraffic, setLiveTraffic] = useState<{ active: boolean; congestion: number }>({ active: false, congestion: 0 });
+  const [selectedVehicle, setSelectedVehicle] = useState<{ id: number; type: string; speed: number } | null>(null);
+  const selectedVehicleIdRef = useRef<number | null>(null);
+  const [history, setHistory] = useState<{ health: number; flow: number }[]>([]);
+  const historyPrevRef = useRef<number>(0);
 
   // Modes (URL params allow deep-linking a mode, e.g. ?night=1&rain=1)
   const [isNight, setIsNight] = useState<boolean>(false);
@@ -324,6 +110,9 @@ export default function CityViewer() {
 
     // Vehicles
     const bodyMeshes = {} as Record<VehicleType, THREE.InstancedMesh>;
+    // instance index -> vehicle id, per type; rebuilt every render frame so
+    // clicks on an InstancedMesh can resolve to the actual vehicle
+    const instanceIds: Record<VehicleType, number[]> = { car: [], bus: [], auto: [], bike: [], truck: [] };
     const headlightMeshes = {} as Record<VehicleType, THREE.InstancedMesh>;
     const taillightMeshes = {} as Record<VehicleType, THREE.InstancedMesh>;
     const MAX_INSTANCES = 600;
@@ -575,6 +364,7 @@ export default function CityViewer() {
       const ribbonGeoms: THREE.BufferGeometry[] = [];
       const dashGeoms: THREE.BufferGeometry[] = [];
       const pillarGeoms: THREE.BufferGeometry[] = [];
+      const railGeoms: THREE.BufferGeometry[] = [];
 
       // Nodes shared with ground roads are ramp ends — deck descends to 0 there
       const groundKeys = new Set<string>();
@@ -613,6 +403,15 @@ export default function CityViewer() {
             }
             acc = (acc + segLen) % 25;
           }
+
+          // Side railings: low parapet walls along both deck edges — they
+          // sell the height far better than a flat floating ribbon
+          const railHeights = heights.map((h) => h + 0.55);
+          for (const side of [1, -1]) {
+            const railPts = offsetPolyline(pts, side * (width / 2 + 0.12));
+            const rail = buildRibbon(railPts, 0.28, railHeights);
+            if (rail) railGeoms.push(rail);
+          }
         }
 
         // Dashed centerline for multi-lane roads (follows deck height)
@@ -647,6 +446,11 @@ export default function CityViewer() {
         const mesh = new THREE.Mesh(merged, mat);
         mesh.castShadow = true;
         scene.add(mesh);
+      }
+      if (railGeoms.length) {
+        const merged = BufferGeometryUtils.mergeGeometries(railGeoms);
+        const mat = new THREE.MeshStandardMaterial({ color: 0x8f8a7d, roughness: 0.85, side: THREE.DoubleSide });
+        scene.add(new THREE.Mesh(merged, mat));
       }
 
       if (ribbonGeoms.length) {
@@ -1067,14 +871,114 @@ export default function CityViewer() {
       });
     };
 
+    // ─── Incident injection: click a road to close/reopen it ───
+    const roadsData: Road[] = [];
+    const closedOverlays = new Map<number, THREE.Mesh>();
+
+    const roadAtWorldPoint = (wx: number, wz: number): Road | null => {
+      // three.js z = -sim y
+      const sy = -wz;
+      let best: Road | null = null, bestD = Infinity;
+      for (const r of roadsData) {
+        if (!r.coordinates || r.coordinates.length < 2) continue;
+        const maxD = roadWidth(r) / 2 + 4;
+        for (let i = 0; i < r.coordinates.length - 1; i++) {
+          const a = r.coordinates[i], b = r.coordinates[i + 1];
+          const d2 = distSqToSegment(wx, sy, a.x, a.y, b.x, b.y);
+          if (d2 < maxD * maxD && d2 < bestD) { bestD = d2; best = r; }
+        }
+      }
+      return best;
+    };
+
+    const setRoadOverlay = (roadId: number, closed: boolean) => {
+      const existing = closedOverlays.get(roadId);
+      if (!closed) {
+        if (existing) { scene.remove(existing); closedOverlays.delete(roadId); }
+        return;
+      }
+      if (existing) return;
+      const road = roadsData.find((r) => r.id === roadId);
+      if (!road) return;
+      const elevated = (road.layer ?? 0) > 0 || !!road.bridge;
+      const pts = road.coordinates.map((p) => new THREE.Vector2(p.x, -p.y));
+      const geo = buildRibbon(pts, roadWidth(road) + 1.0, elevated ? 8.35 : 0.35);
+      if (!geo) return;
+      const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({
+        color: 0xd83a2e, transparent: true, opacity: 0.55, side: THREE.DoubleSide,
+      }));
+      mesh.renderOrder = 10;
+      scene.add(mesh);
+      closedOverlays.set(roadId, mesh);
+    };
+
+    const initRoadPicking = () => {
+      const el = renderer.domElement;
+      const raycaster = new THREE.Raycaster();
+      const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+      const hit = new THREE.Vector3();
+      let down: { x: number; y: number; t: number } | null = null;
+
+      el.addEventListener("pointerdown", (e) => {
+        down = { x: e.clientX, y: e.clientY, t: Date.now() };
+      });
+      el.addEventListener("pointerup", (e) => {
+        if (!down) return;
+        const moved = Math.hypot(e.clientX - down.x, e.clientY - down.y);
+        const dt = Date.now() - down.t;
+        down = null;
+        if (moved > 6 || dt > 400) return; // that was an orbit drag, not a click
+        const rect = el.getBoundingClientRect();
+        const ndc = new THREE.Vector2(
+          ((e.clientX - rect.left) / rect.width) * 2 - 1,
+          -((e.clientY - rect.top) / rect.height) * 2 + 1
+        );
+        raycaster.setFromCamera(ndc, camera);
+
+        // Vehicles take priority over road toggling
+        const meshes = Object.values(bodyMeshes).filter(Boolean);
+        const vHit = raycaster.intersectObjects(meshes, false)[0];
+        if (vHit && vHit.instanceId !== undefined) {
+          const type = (Object.keys(bodyMeshes) as VehicleType[])
+            .find((t) => bodyMeshes[t] === vHit.object);
+          const vid = type ? instanceIds[type][vHit.instanceId] : undefined;
+          if (vid !== undefined) {
+            selectedVehicleIdRef.current = vid;
+            return;
+          }
+        }
+        selectedVehicleIdRef.current = null;
+        setSelectedVehicle(null);
+
+        // Closing a road is destructive — require Shift+click so vehicle
+        // selection misses don't take out half the network
+        if (!e.shiftKey) return;
+        if (!raycaster.ray.intersectPlane(groundPlane, hit)) return;
+        const road = roadAtWorldPoint(hit.x, hit.z);
+        if (road) socketRef.current?.emit("toggle_road", { road_id: road.id });
+      });
+    };
+
     // ─── WebSocket ───
     const initWebSocket = () => {
       const socket = io(BACKEND_URL);
       socketRef.current = socket;
 
+      socket.on("road_state", (data: { road_id: number; closed: boolean }) => {
+        setRoadOverlay(data.road_id, data.closed);
+      });
+
       socket.on("traffic_update", (data) => {
         if (data.live_traffic) {
           setLiveTraffic({ active: data.live_traffic.active, congestion: data.live_traffic.congestion });
+        }
+        // Keep closure overlays in sync (covers reconnects / missed events)
+        if (Array.isArray(data.closed_roads)) {
+          const closedSet = new Set<number>(data.closed_roads);
+          closedSet.forEach((id) => setRoadOverlay(id, true));
+          for (const id of [...closedOverlays.keys()]) {
+            if (!closedSet.has(id)) setRoadOverlay(id, false);
+          }
         }
         if (data.metrics) {
           setMetrics(data.metrics);
@@ -1086,6 +990,22 @@ export default function CityViewer() {
             }
             idlePrevRef.current = { t: now, v: data.metrics.idle_co2_kg_h };
           }
+          // Rolling 3-minute history for the HUD sparklines (2s sampling)
+          if (now - historyPrevRef.current > 2000) {
+            historyPrevRef.current = now;
+            setHistory((h) => [
+              ...h.slice(-88),
+              { health: data.metrics.health, flow: data.metrics.junction_flow },
+            ]);
+          }
+        }
+
+        // Live update for the selected-vehicle card
+        const selId = selectedVehicleIdRef.current;
+        if (selId !== null) {
+          const sv = (data.vehicles as SocketVehicle[]).find((v) => v.id === selId);
+          if (sv) setSelectedVehicle({ id: sv.id, type: sv.type, speed: sv.speed });
+          else { selectedVehicleIdRef.current = null; setSelectedVehicle(null); }
         }
 
         // Traffic lights: create small signal poles on first update, then recolor
@@ -1169,6 +1089,8 @@ export default function CityViewer() {
         createIndianFlag(parkInfo ? parkInfo.cx : 0, parkInfo ? parkInfo.cz : 0);
         createStreetlamps(data.roads);
         createLabels(data);
+        roadsData.push(...data.roads);
+        initRoadPicking();
         initRain();
         initVehicles();
         initWebSocket();
@@ -1332,6 +1254,7 @@ export default function CityViewer() {
         dummy.updateMatrix();
 
         bodyMeshes[type].setMatrixAt(idx, dummy.matrix);
+        instanceIds[type][idx] = v.id;
         const palette = VEHICLE_COLORS[type];
         bodyMeshes[type].setColorAt(idx, getColor(palette[v.id % palette.length]));
 
@@ -1444,6 +1367,21 @@ export default function CityViewer() {
               )}
             </div>
 
+            {/* ── 3-minute trend sparklines ── */}
+            {history.length > 4 && (
+              <div className="hidden lg:flex items-center gap-4 px-3">
+                {([["HEALTH", "health", "#34d399"], ["FLOW", "flow", "#fbbf24"]] as const).map(([label, key, color]) => (
+                  <div key={label} className="flex flex-col items-start">
+                    <LineChart width={110} height={30} data={history}>
+                      <Line type="monotone" dataKey={key} stroke={color} dot={false} strokeWidth={1.5} isAnimationActive={false} />
+                      <YAxis hide domain={["auto", "auto"]} />
+                    </LineChart>
+                    <div className="text-[9px] font-mono text-neutral-500 tracking-widest">{label} · 3MIN</div>
+                  </div>
+                ))}
+              </div>
+            )}
+
             {/* ── Mode + speed controls ── */}
             <div className="flex items-center gap-2 p-3 pointer-events-auto">
               <div className="text-[10px] font-mono text-neutral-500 mr-1 hidden md:block">
@@ -1545,7 +1483,24 @@ export default function CityViewer() {
             <div className="text-[11px] font-mono tracking-[0.25em] text-neutral-400 mt-2">
               LIVE TRAFFIC SIMULATION
             </div>
+            <div className="text-[10px] font-mono tracking-[0.15em] text-neutral-500 mt-1">
+              CLICK VEHICLE = INSPECT · SHIFT+CLICK ROAD = CLOSE / REOPEN
+            </div>
           </div>
+
+          {/* ── Selected vehicle card ── */}
+          {selectedVehicle && (
+            <div className="absolute bottom-24 right-4 pointer-events-none bg-black/80 border border-amber-200/40 px-4 py-3 font-mono text-xs text-neutral-200">
+              <div className="text-[10px] tracking-[0.25em] text-amber-200 mb-1.5">
+                VEHICLE #{selectedVehicle.id}
+              </div>
+              <div className="leading-relaxed">
+                TYPE&nbsp;&nbsp;&nbsp;{selectedVehicle.type.toUpperCase()}
+                <br />
+                SPEED&nbsp;&nbsp;{selectedVehicle.speed.toFixed(0)} km/h
+              </div>
+            </div>
+          )}
 
           {/* ── Revolve controls (hold to orbit) ── */}
           <div className="absolute bottom-8 right-8 z-40 flex items-center gap-2 select-none">
