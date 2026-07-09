@@ -96,7 +96,7 @@ class Vehicle:
         self.finished = False
         self.current_edge = (route[0], route[1]) if len(route) > 1 else None
 
-    def update_position(self, dt, lead_vehicle=None, red_light_node=None):
+    def update_position(self, dt, lead_vehicle=None, red_light_node=None, gap_scale=1.0):
         """
         Updates position along the route segments with collision avoidance.
         If red_light_node is provided, the vehicle treats it as a wall.
@@ -137,10 +137,10 @@ class Vehicle:
             dy_lead = lead_vehicle.y - self.y
             dist_to_lead = math.sqrt(dx_lead*dx_lead + dy_lead*dy_lead) - (self.length/2 + lead_vehicle.length/2)
 
-            if dist_to_lead < self.stop_gap:
+            if dist_to_lead < self.stop_gap * gap_scale:
                 # Dangerously close: Stop completely
                 target_vel = 0.0
-            elif dist_to_lead < self.follow_dist:
+            elif dist_to_lead < self.follow_dist * gap_scale:
                 # Approaching: Slow down to match leader speed
                 target_vel = min(target_vel, lead_vehicle.speed * 0.8)
         
@@ -193,6 +193,15 @@ class TrafficSimulation:
         # roads are ramp ends at 0. Vehicle z interpolates along each edge.
         self.DECK_HEIGHT = 8.0
         self.node_height = {}           # node -> metres above ground
+
+        # Incident injection: roads can be closed at runtime (accident, works).
+        self.road_edges = {}            # road_id -> [(a, b), ...] directed edges
+        self.closed_roads = {}          # road_id -> [(a, b, attrs), ...] removed edges
+
+        # Weather coupling: rain slows traffic and stretches following gaps.
+        # Set from the WeatherManager each broadcast cycle.
+        self.rain_factor = 1.0          # target-speed multiplier (0.7 in rain)
+        self.gap_scale = 1.0            # follow-distance multiplier (1.4 in rain)
 
         # Simulation control + metrics state
         self.speed_mult = 1              # 1x or 10x time scale
@@ -256,12 +265,14 @@ class TrafficSimulation:
                 self.graph.add_edge(pt_a, pt_b, weight=cost, length=dist,
                                     name=road["name"], oneway=road["oneway"],
                                     rtype=road["type"])
+                self.road_edges.setdefault(road["id"], []).append((pt_a, pt_b))
 
                 # If not a oneway street, add reverse edge (B to A)
                 if not road["oneway"]:
                     self.graph.add_edge(pt_b, pt_a, weight=cost, length=dist,
                                         name=road["name"], oneway=road["oneway"],
                                         rtype=road["type"])
+                    self.road_edges[road["id"]].append((pt_b, pt_a))
 
                 if is_roundabout:
                     self.roundabout_nodes.add(pt_a)
@@ -528,8 +539,10 @@ class TrafficSimulation:
                     v.target_speed = min(max_v, (real_kmh / 3.6) * 1.2) * v.speed_pref
                 else:
                     v.target_speed = max_v * self.live_traffic.ratio_at(v.x, v.y) * v.speed_pref
+                # Rain slows everyone down and stretches following distances
+                v.target_speed *= self.rain_factor
                 prev_index = v.route_index
-                v.update_position(dt, lead, red_light_node=red_node)
+                v.update_position(dt, lead, red_light_node=red_node, gap_scale=self.gap_scale)
 
                 # Track junction crossings for flow metric
                 if v.route_index > prev_index and end_node_of_edge in self.junction_set:
@@ -543,10 +556,11 @@ class TrafficSimulation:
             del self.vehicles[v_id]
 
         # 3. Dynamic Spawning: Maintain a target density.
-        # With live data, density scales with real network congestion.
-        density = self.target_density
+        # Scales with time-of-day (rush hours) and, when live data is
+        # available, with real network congestion.
+        density = int(self.target_density * self.time_of_day_factor())
         if self.live_traffic.active:
-            density = int(self.target_density * (0.7 + 0.6 * self.live_traffic.congestion))
+            density = int(density * (0.7 + 0.6 * self.live_traffic.congestion))
         if len(self.vehicles) < density:
             # Spawn in bursts so density ramps up quickly
             for _ in range(min(4, density - len(self.vehicles))):
@@ -616,6 +630,82 @@ class TrafficSimulation:
             "health": health,
         }
 
+    # Traffic volume relative to peak, by local hour. Indian arterial pattern:
+    # morning peak 8-11, evening peak 17-21, quiet nights.
+    HOURLY_DENSITY = [
+        0.30, 0.25, 0.22, 0.22, 0.28, 0.40,  # 00-05
+        0.55, 0.75, 0.95, 1.00, 1.00, 0.90,  # 06-11
+        0.80, 0.80, 0.75, 0.75, 0.85, 1.00,  # 12-17
+        1.00, 1.00, 0.95, 0.80, 0.60, 0.40,  # 18-23
+    ]
+
+    def time_of_day_factor(self):
+        """Density multiplier for the current local (IST) hour."""
+        return self.HOURLY_DENSITY[time.localtime().tm_hour]
+
+    def toggle_road(self, road_id):
+        """
+        Closes an open road (accident / roadworks scenario) or reopens a
+        closed one. Returns True when the road is now closed.
+        Closing removes its edges from the routing graph and reroutes every
+        vehicle whose remaining route used them.
+        """
+        if road_id in self.closed_roads:
+            for a, b, attrs in self.closed_roads.pop(road_id):
+                self.graph.add_edge(a, b, **attrs)
+            print(f"Road {road_id} reopened.")
+            return False
+
+        edges = self.road_edges.get(road_id)
+        if not edges:
+            return False
+        removed = []
+        for a, b in edges:
+            if self.graph.has_edge(a, b):
+                removed.append((a, b, dict(self.graph.edges[a, b])))
+                self.graph.remove_edge(a, b)
+        self.closed_roads[road_id] = removed
+
+        closed_set = set(edges)
+        rerouted = despawned = 0
+        for v in list(self.vehicles.values()):
+            if v.finished or not v.current_edge:
+                continue
+            remaining = [
+                (v.route[i], v.route[i + 1])
+                for i in range(v.route_index, len(v.route) - 1)
+            ]
+            if not any(e in closed_set for e in remaining):
+                continue
+            # Reroute from the end of the vehicle's current edge to its goal.
+            # A vehicle already on the closed stretch simply rolls to the end
+            # of its current segment and diverts there (physics doesn't
+            # consult the graph mid-edge).
+            resume, goal = v.current_edge[1], v.route[-1]
+            new_route = self.find_route(resume, goal) if resume != goal else None
+            if not new_route or len(new_route) < 2:
+                # Original destination unreachable — divert to another exit
+                # gate like a real driver would, instead of vanishing
+                for _ in range(5):
+                    if not self.exit_gates:
+                        break
+                    alt = random.choices(*zip(*[(n, w) for n, w in self.exit_gates]))[0]
+                    if alt == resume:
+                        continue
+                    new_route = self.find_route(resume, alt)
+                    if new_route and len(new_route) >= 2:
+                        break
+            if new_route and len(new_route) >= 2:
+                v.route = [v.current_edge[0]] + new_route
+                v.route_index = 0
+                rerouted += 1
+            else:
+                v.finished = True  # trapped: no path remains anywhere
+                despawned += 1
+        print(f"Road {road_id} closed: {len(removed)} edges removed, "
+              f"{rerouted} vehicles rerouted, {despawned} despawned.")
+        return True
+
     def calibration_deviation(self):
         """
         Twin accuracy: mean |sim - real| / real speed across TomTom sample
@@ -650,8 +740,7 @@ async def run_simulation_loop(sim, sio_server, run_event):
     print("Simulation background worker thread started.")
     
     total_co2_emitted = 0.0
-    start_time = time.time()
-    
+
     while True:
         if run_event.is_set():
             # Step the simulation physics (multiple sub-steps when time-scaled)
@@ -682,18 +771,24 @@ async def run_simulation_loop(sim, sio_server, run_event):
             # run it in a worker thread so the event loop (and websockets) never stall
             weather_data = await asyncio.to_thread(sim.weather_manager.get_weather)
 
+            # Couple weather into the physics: rain = slower, bigger gaps
+            raining = bool(weather_data.get("raining"))
+            sim.rain_factor = 0.7 if raining else 1.0
+            sim.gap_scale = 1.4 if raining else 1.0
+
             # Broadcast vehicle positions + traffic lights + telemetry
             await sio_server.emit("traffic_update", {
                 "vehicles": vehicles_data,
                 "co2_delta": round(step_co2, 2),
                 "co2_total": round(total_co2_emitted, 1),
                 "active_vehicles": len(sim.vehicles),
-                "elapsed_time": int(time.time() - start_time),
+                "elapsed_time": int(sim.sim_time),  # simulated seconds — freezes when paused
                 "weather": weather_data,
                 "traffic_lights": lights_data,
                 "road_density": metrics["road_density"],
                 "speed_mult": sim.speed_mult,
                 "live_traffic": sim.live_traffic.snapshot(),
+                "closed_roads": list(sim.closed_roads.keys()),
                 "metrics": {
                     "health": round(metrics["health"], 1),
                     "avg_delay_s": round(metrics["avg_delay_s"]),

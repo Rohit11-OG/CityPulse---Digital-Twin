@@ -112,6 +112,18 @@ async def stop_simulation(sid, data):
     await sio.emit("simulation_status", {"status": "stopped"})
 
 @sio.event
+async def toggle_road(sid, data):
+    """Close or reopen a road (incident injection). Rerouting is automatic."""
+    global sim
+    try:
+        road_id = int(data.get("road_id"))
+    except (TypeError, ValueError):
+        return
+    if sim:
+        closed = sim.toggle_road(road_id)
+        await sio.emit("road_state", {"road_id": road_id, "closed": closed})
+
+@sio.event
 async def set_speed(sid, data):
     """Set simulation time scale (1x / 10x)."""
     global sim
