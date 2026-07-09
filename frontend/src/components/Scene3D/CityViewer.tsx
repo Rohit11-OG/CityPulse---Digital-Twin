@@ -46,6 +46,7 @@ interface ClientVehicle {
 interface Metrics {
   health: number; avg_delay_s: number; junction_flow: number;
   queued_m: number; idle_co2_kg_h: number; idle_fuel_l_h: number;
+  calibration_dev_pct?: number | null;
 }
 
 type VehicleType = "car" | "bus" | "auto" | "bike" | "truck";
@@ -920,7 +921,10 @@ export default function CityViewer() {
     };
 
     // ─── Location name labels (map-style sprites) ───
-    const makeLabelSprite = (text: string, opts: { size?: number; color?: string; y: number; x: number; z: number }) => {
+    // Labels fade with camera distance to prevent horizon clutter at low angles
+    const labelSprites: { sprite: THREE.Sprite; mat: THREE.SpriteMaterial; maxDist: number }[] = [];
+
+    const makeLabelSprite = (text: string, opts: { size?: number; color?: string; y: number; x: number; z: number; maxDist?: number }) => {
       const fontPx = 44;
       const pad = 26;
       const canvas = document.createElement("canvas");
@@ -955,6 +959,7 @@ export default function CityViewer() {
       sprite.position.set(opts.x, opts.y, opts.z);
       sprite.renderOrder = 999;
       scene.add(sprite);
+      labelSprites.push({ sprite, mat, maxDist: opts.maxDist ?? 700 });
     };
 
     const createLabels = (data: SceneData) => {
@@ -965,7 +970,7 @@ export default function CityViewer() {
         if (!key || seen.has(key)) return;
         seen.add(key);
         const short = lm.name.length > 28 ? lm.name.slice(0, 26) + "…" : lm.name;
-        makeLabelSprite(short, { x: lm.x, y: 34, z: -lm.y, size: 9 });
+        makeLabelSprite(short, { x: lm.x, y: 34, z: -lm.y, size: 9, maxDist: 650 });
       });
 
       // Named parks / gardens
@@ -975,7 +980,7 @@ export default function CityViewer() {
         if (seen.has(key)) return;
         seen.add(key);
         const c = polygonCentroid(g.coordinates);
-        makeLabelSprite(g.name, { x: c.x, y: 26, z: -c.y, size: 9, color: "#c9e8ae" });
+        makeLabelSprite(g.name, { x: c.x, y: 26, z: -c.y, size: 9, color: "#c9e8ae", maxDist: 500 });
       });
 
       // Major road names — longest unique-named roads
@@ -990,7 +995,7 @@ export default function CityViewer() {
         .slice(0, 14)
         .forEach((r) => {
           const mid = r.coordinates[Math.floor(r.coordinates.length / 2)];
-          makeLabelSprite(r.name, { x: mid.x, y: 14, z: -mid.y, size: 6.5, color: "#d8d6ce" });
+          makeLabelSprite(r.name, { x: mid.x, y: 14, z: -mid.y, size: 6.5, color: "#d8d6ce", maxDist: 400 });
         });
     };
 
@@ -1119,11 +1124,16 @@ export default function CityViewer() {
         const activeIds = new Set<number>();
         const vMap = vehiclesMapRef.current;
         const LANE_OFFSET = 2.0;
+        // Lateral spread within the lane: Indian traffic doesn't queue single
+        // file. Deterministic per-id jitter; two-wheelers wander the most.
+        const JITTER_AMP: Record<string, number> = { bike: 1.8, auto: 1.2, car: 0.6, bus: 0.25, truck: 0.25 };
 
         data.vehicles.forEach((v: SocketVehicle) => {
           activeIds.add(v.id);
-          const ox = v.x - Math.sin(v.angle) * LANE_OFFSET;
-          const oy = v.y + Math.cos(v.angle) * LANE_OFFSET;
+          const jitter = (((v.id * 2654435761) >>> 16) % 1000) / 1000 - 0.5; // stable [-0.5, 0.5)
+          const lane = LANE_OFFSET + jitter * 2 * (JITTER_AMP[v.type] ?? 0.5);
+          const ox = v.x - Math.sin(v.angle) * lane;
+          const oy = v.y + Math.cos(v.angle) * lane;
           const tx = ox, ty = v.z ?? 0, tz = -oy, ta = v.angle;
           const existing = vMap.get(v.id);
           if (existing) {
@@ -1212,6 +1222,18 @@ export default function CityViewer() {
       // First frames snap to the active mode (deep links); afterwards smooth transition
       frameCount++;
       const F = frameCount < 8 ? 1 : 0.045;
+
+      // Label declutter: fade sprites out beyond their tier's view distance
+      if (frameCount % 6 === 0 && labelSprites.length) {
+        const camPos = camera.position;
+        const FADE_BAND = 120;
+        for (const l of labelSprites) {
+          const d = camPos.distanceTo(l.sprite.position);
+          const op = Math.min(1, Math.max(0, (l.maxDist - d) / FADE_BAND));
+          l.mat.opacity = op * 0.95;
+          l.sprite.visible = op > 0.03;
+        }
+      }
 
       // Sky + fog + lights
       skyUniforms.uMix.value += ((night ? 1 : 0) - skyUniforms.uMix.value) * F;
@@ -1509,6 +1531,7 @@ export default function CityViewer() {
               {liveTraffic.active ? (
                 <span className="text-[10px] font-mono px-2 py-0.5 border border-emerald-400/60 text-emerald-300 bg-emerald-950/60">
                   ● TOMTOM LIVE · {Math.round(liveTraffic.congestion * 100)}% CONGESTION
+                  {metrics.calibration_dev_pct != null && ` · TWIN ±${metrics.calibration_dev_pct}%`}
                 </span>
               ) : (
                 <span className="text-[10px] font-mono px-2 py-0.5 border border-white/15 text-neutral-500 bg-black/40">

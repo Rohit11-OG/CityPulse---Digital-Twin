@@ -118,7 +118,8 @@ class LiveTrafficManager:
                     self.congestion = 1.0 - (sum(ratios) / len(ratios)) if ratios else 0.0
                     self.active = True
                     self._ratio_points = tuple(
-                        (s["x"], s["y"], s["ratio"]) for s in self.samples
+                        (s["x"], s["y"], s["ratio"], s["current_kmh"])
+                        for s in self.samples
                     )
                 print(f"LiveTraffic: refreshed {ok}/{len(self.samples)} points. "
                       f"Network congestion: {self.congestion * 100:.0f}%")
@@ -130,11 +131,28 @@ class LiveTrafficManager:
         if not self.active or not points:
             return 1.0
         best, best_d = 1.0, float("inf")
-        for px, py, ratio in points:
+        for px, py, ratio, _cur in points:
             d = (px - x) ** 2 + (py - y) ** 2
             if d < best_d:
                 best_d = d
                 best = ratio
+        return best
+
+    def speed_points(self):
+        """Immutable (x, y, ratio, current_kmh) tuples; empty when inactive."""
+        return self._ratio_points if self.active else ()
+
+    def speed_at(self, x, y):
+        """Real measured speed (km/h) at the nearest sample point, or None."""
+        points = self._ratio_points
+        if not self.active or not points:
+            return None
+        best, best_d = None, float("inf")
+        for px, py, _ratio, cur in points:
+            d = (px - x) ** 2 + (py - y) ** 2
+            if d < best_d:
+                best_d = d
+                best = cur
         return best
 
     def snapshot(self):

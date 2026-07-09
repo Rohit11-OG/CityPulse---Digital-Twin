@@ -11,13 +11,20 @@ from simulation.weather import WeatherManager
 
 # Vehicle configurations by type
 # co2_rate: g CO2/km while moving | idle_co2: kg CO2/h while idling | idle_fuel: litres fuel/h while idling
+# stop_gap: bumper gap when queued (m) | follow_dist: distance where following starts (m)
+# Two-wheelers and autos squeeze into far smaller gaps than cars — that's what
+# makes Indian junction queues pack the way they do.
 VEHICLE_TYPES = {
-    "car": {"length": 4.5, "max_speed": 13.8, "co2_rate": 120.0, "idle_co2": 1.4, "idle_fuel": 0.6},
-    "bus": {"length": 12.0, "max_speed": 10.0, "co2_rate": 800.0, "idle_co2": 4.5, "idle_fuel": 2.0},
-    "auto": {"length": 3.0, "max_speed": 8.3, "co2_rate": 80.0, "idle_co2": 0.9, "idle_fuel": 0.4},
-    "bike": {"length": 1.8, "max_speed": 11.1, "co2_rate": 0.0, "idle_co2": 0.0, "idle_fuel": 0.0},
-    "truck": {"length": 8.0, "max_speed": 9.0, "co2_rate": 600.0, "idle_co2": 3.8, "idle_fuel": 1.7}
+    "car": {"length": 4.5, "max_speed": 13.8, "co2_rate": 120.0, "idle_co2": 1.4, "idle_fuel": 0.6, "stop_gap": 4.0, "follow_dist": 15.0},
+    "bus": {"length": 12.0, "max_speed": 10.0, "co2_rate": 800.0, "idle_co2": 4.5, "idle_fuel": 2.0, "stop_gap": 6.0, "follow_dist": 20.0},
+    "auto": {"length": 3.0, "max_speed": 8.3, "co2_rate": 80.0, "idle_co2": 0.9, "idle_fuel": 0.4, "stop_gap": 2.0, "follow_dist": 8.0},
+    "bike": {"length": 1.8, "max_speed": 11.1, "co2_rate": 0.0, "idle_co2": 0.0, "idle_fuel": 0.0, "stop_gap": 1.2, "follow_dist": 6.0},
+    "truck": {"length": 8.0, "max_speed": 9.0, "co2_rate": 600.0, "idle_co2": 3.8, "idle_fuel": 1.7, "stop_gap": 6.0, "follow_dist": 20.0}
 }
+
+# Traffic composition at a typical Nashik arterial junction (field-estimate;
+# refine with an actual classified count at Mumbai Naka).
+VEHICLE_MIX = {"bike": 0.45, "car": 0.25, "auto": 0.15, "truck": 0.08, "bus": 0.07}
 
 # Calibration: one simulated vehicle represents 2.5 real vehicles
 SIM_VEHICLE_FACTOR = 2.5
@@ -78,6 +85,11 @@ class Vehicle:
         self.speed = self.target_speed
         self.length = VEHICLE_TYPES[vehicle_type]["length"]
         self.co2_rate = VEHICLE_TYPES[vehicle_type]["co2_rate"]
+        self.stop_gap = VEHICLE_TYPES[vehicle_type]["stop_gap"]
+        self.follow_dist = VEHICLE_TYPES[vehicle_type]["follow_dist"]
+        # Driver personality: some run above the local pace, some below —
+        # prevents robotically uniform speeds
+        self.speed_pref = random.uniform(0.85, 1.15)
         
         # Tracking variables
         self.angle = 0.0
@@ -112,22 +124,23 @@ class Vehicle:
         if red_light_node is not None:
             rlx, rly = red_light_node
             dist_to_light = math.sqrt((rlx - self.x)**2 + (rly - self.y)**2) - self.length
-            if dist_to_light < 5.0:
+            if dist_to_light < self.stop_gap:
                 target_vel = 0.0
             elif dist_to_light < 20.0:
                 target_vel = min(target_vel, self.target_speed * (dist_to_light / 20.0))
 
-        # ── Lead-vehicle following ──
+        # ── Lead-vehicle following (gap sizes depend on vehicle type: bikes
+        # and autos squeeze in much closer than cars, buses hang back) ──
         if lead_vehicle:
             # Calculate distance between centers minus vehicle lengths
             dx_lead = lead_vehicle.x - self.x
             dy_lead = lead_vehicle.y - self.y
             dist_to_lead = math.sqrt(dx_lead*dx_lead + dy_lead*dy_lead) - (self.length/2 + lead_vehicle.length/2)
-            
-            if dist_to_lead < 5.0:
+
+            if dist_to_lead < self.stop_gap:
                 # Dangerously close: Stop completely
                 target_vel = 0.0
-            elif dist_to_lead < 15.0:
+            elif dist_to_lead < self.follow_dist:
                 # Approaching: Slow down to match leader speed
                 target_vel = min(target_vel, lead_vehicle.speed * 0.8)
         
@@ -438,10 +451,9 @@ class TrafficSimulation:
         if not route or len(route) < 2:
             return  # Couldn't find a path this tick
             
-        # Spawn random vehicle type weighted towards cars
+        # Vehicle type follows the observed local traffic composition
         v_type = random.choices(
-            ["car", "bus", "auto", "bike", "truck"], 
-            weights=[0.60, 0.05, 0.20, 0.10, 0.05]
+            list(VEHICLE_MIX.keys()), weights=list(VEHICLE_MIX.values())
         )[0]
         
         self.vehicle_id_counter += 1
@@ -506,8 +518,16 @@ class TrafficSimulation:
                 lead = None
                 if i > 0:
                     lead = vehicles_on_edge[i-1]
-                # Throttle to real measured road speed when live traffic data is active
-                v.target_speed = VEHICLE_TYPES[v.type]["max_speed"] * self.live_traffic.ratio_at(v.x, v.y)
+                # Calibrate to reality: TomTom gives the actual measured speed
+                # on the nearest sampled road — cap vehicles at it directly
+                # (20% headroom: the measured mean includes queued vehicles).
+                # Falls back to free-flow x ratio when live data is off.
+                max_v = VEHICLE_TYPES[v.type]["max_speed"]
+                real_kmh = self.live_traffic.speed_at(v.x, v.y)
+                if real_kmh:
+                    v.target_speed = min(max_v, (real_kmh / 3.6) * 1.2) * v.speed_pref
+                else:
+                    v.target_speed = max_v * self.live_traffic.ratio_at(v.x, v.y) * v.speed_pref
                 prev_index = v.route_index
                 v.update_position(dt, lead, red_light_node=red_node)
 
@@ -596,6 +616,30 @@ class TrafficSimulation:
             "health": health,
         }
 
+    def calibration_deviation(self):
+        """
+        Twin accuracy: mean |sim - real| / real speed across TomTom sample
+        points that have >= 3 sim vehicles nearby. Percent, or None without
+        live data. 0% = simulated speeds match measured reality exactly.
+        """
+        points = self.live_traffic.speed_points()
+        if not points:
+            return None
+        devs = []
+        R2 = 60.0 ** 2  # vehicles within 60 m of the sample point
+        for px, py, _ratio, cur_kmh in points:
+            if cur_kmh <= 0:
+                continue
+            speeds = [v.speed for v in self.vehicles.values()
+                      if (v.x - px) ** 2 + (v.y - py) ** 2 < R2]
+            if len(speeds) < 3:
+                continue
+            sim_kmh = (sum(speeds) / len(speeds)) * 3.6
+            devs.append(abs(sim_kmh - cur_kmh) / cur_kmh)
+        if not devs:
+            return None
+        return round(100.0 * sum(devs) / len(devs))
+
 
 # Async runner for FastAPI integration
 async def run_simulation_loop(sim, sio_server, run_event):
@@ -657,6 +701,7 @@ async def run_simulation_loop(sim, sio_server, run_event):
                     "queued_m": round(metrics["queued_m"]),
                     "idle_co2_kg_h": round(metrics["idle_co2_kg_h"]),
                     "idle_fuel_l_h": round(metrics["idle_fuel_l_h"]),
+                    "calibration_dev_pct": sim.calibration_deviation(),
                 },
             })
 
