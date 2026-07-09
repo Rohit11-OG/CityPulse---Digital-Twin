@@ -44,12 +44,17 @@ export default function CityViewer() {
   const [viewMode, setViewMode] = useState<"live" | "demo">("live");
   const [speedMult, setSpeedMult] = useState<number>(1);
 
+  // Deep-link init from URL params — must run in an effect: window is
+  // undefined during the server prerender pass, and lazy useState would
+  // cause a hydration mismatch when a param is set
+  /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     if (params.get("night") === "1") setIsNight(true);
     if (params.get("rain") === "1") setIsRaining(true);
     if (params.get("demo") === "1") setViewMode("demo");
   }, []);
+  /* eslint-enable react-hooks/set-state-in-effect */
 
   // Refs for the render loop
   const isNightRef = useRef(false);
@@ -101,8 +106,8 @@ export default function CityViewer() {
     let glassMesh: THREE.Mesh | null = null;
     let clayEdges: THREE.LineSegments | null = null;
     let groundMesh: THREE.Mesh | null = null;
-    let asphaltMeshes: THREE.Mesh[] = [];
-    let grassMeshes: THREE.Mesh[] = [];
+    const asphaltMeshes: THREE.Mesh[] = [];
+    const grassMeshes: THREE.Mesh[] = [];
     let windowsMesh: THREE.Mesh | null = null;
     let lampBulbs: THREE.InstancedMesh | null = null;
     let lampGlow: THREE.InstancedMesh | null = null;
@@ -1306,7 +1311,7 @@ export default function CityViewer() {
         renderer.domElement.remove();
       }
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+     
   }, []);
 
   // ═══════════════════════════════════════════════════════
