@@ -124,6 +124,25 @@ async def toggle_road(sid, data):
         await sio.emit("road_state", {"road_id": road_id, "closed": closed})
 
 @sio.event
+async def get_route(sid, data):
+    """Remaining route polyline for one vehicle (inspect panel's glow line)."""
+    global sim
+    try:
+        v_id = int(data.get("id"))
+    except (TypeError, ValueError):
+        return
+    v = sim.vehicles.get(v_id) if sim else None
+    if not v or v.finished:
+        await sio.emit("vehicle_route", {"id": v_id, "points": []}, to=sid)
+        return
+    points = [{"x": round(v.x, 1), "y": round(v.y, 1),
+               "h": round(sim.elevation_of(v), 1)}]
+    for node in v.route[v.route_index + 1:]:
+        points.append({"x": node[0], "y": node[1],
+                       "h": sim.node_height.get(node, 0.0)})
+    await sio.emit("vehicle_route", {"id": v_id, "points": points}, to=sid)
+
+@sio.event
 async def set_speed(sid, data):
     """Set simulation time scale (1x / 10x)."""
     global sim

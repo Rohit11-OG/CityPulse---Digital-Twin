@@ -239,9 +239,17 @@ export default function CityViewer() {
 
       // Market streets: walls near these get street-level shopfronts
       const shopSegs: { ax: number; ay: number; bx: number; by: number }[] = [];
+      const deckSegs2: { ax: number; ay: number; bx: number; by: number; half: number }[] = [];
       roads.forEach((r) => {
-        if (!r.coordinates || !["primary", "secondary", "tertiary"].includes(r.type)) return;
-        if ((r.layer ?? 0) > 0 || r.bridge) return;
+        if (!r.coordinates) return;
+        if ((r.layer ?? 0) > 0 || r.bridge) {
+          const half = roadWidth(r) / 2 + 2;
+          for (let i = 0; i < r.coordinates.length - 1; i++) {
+            deckSegs2.push({ ax: r.coordinates[i].x, ay: r.coordinates[i].y, bx: r.coordinates[i + 1].x, by: r.coordinates[i + 1].y, half });
+          }
+          return;
+        }
+        if (!["primary", "secondary", "tertiary"].includes(r.type)) return;
         for (let i = 0; i < r.coordinates.length - 1; i++) {
           shopSegs.push({ ax: r.coordinates[i].x, ay: r.coordinates[i].y, bx: r.coordinates[i + 1].x, by: r.coordinates[i + 1].y });
         }
@@ -251,6 +259,12 @@ export default function CityViewer() {
           if (distSqToSegment(x, y, s.ax, s.ay, s.bx, s.by) < maxD * maxD) return { ax: s.ax, ay: s.ay, bx: s.bx, by: s.by };
         }
         return null;
+      };
+      const underDeck = (x: number, y: number) => {
+        for (const s of deckSegs2) {
+          if (distSqToSegment(x, y, s.ax, s.ay, s.bx, s.by) < s.half * s.half) return true;
+        }
+        return false;
       };
 
       const tint = new THREE.Color();
@@ -289,11 +303,13 @@ export default function CityViewer() {
           edgeGeoms.push(new THREE.EdgesGeometry(geom, 30));
 
           // Street-level shopfronts: walls that face a market street get
-          // colourful shop-unit strips (6 m units, alternating colours)
-          const n = b.coordinates.length;
+          // colourful shop-unit strips (6 m units, alternating colours).
+          // Sheds are too low for shop units; under the flyover it's clutter.
+          const n = height < 4.5 ? 0 : b.coordinates.length;
           for (let i = 0; i < n; i++) {
             const p = b.coordinates[i], q = b.coordinates[(i + 1) % n];
             const mx = (p.x + q.x) / 2, my = (p.y + q.y) / 2;
+            if (underDeck(mx, my)) continue;
             const seg = nearShopStreet(mx, my, 16);
             if (!seg) continue;
             const wallLen = Math.hypot(q.x - p.x, q.y - p.y);
@@ -622,8 +638,31 @@ export default function CityViewer() {
       const spots: { x: number; z: number; s: number }[] = [];
       const MAX_TREES = 3600;
 
+      // No trees on carriageways (green polygons overlap roads at the circle)
+      // and none under the flyover deck (canopies pierce it from below)
+      type Seg = { ax: number; ay: number; bx: number; by: number; half: number };
+      const treeBlockers: Seg[] = [];
+      data.roads.forEach((r) => {
+        if (!r.coordinates || r.coordinates.length < 2) return;
+        const elevated = (r.layer ?? 0) > 0 || !!r.bridge;
+        const half = roadWidth(r) / 2 + (elevated ? 1.5 : 0.8);
+        for (let i = 0; i < r.coordinates.length - 1; i++) {
+          treeBlockers.push({
+            ax: r.coordinates[i].x, ay: r.coordinates[i].y,
+            bx: r.coordinates[i + 1].x, by: r.coordinates[i + 1].y, half,
+          });
+        }
+      });
+      const blocked = (x: number, y: number) => {
+        for (const s of treeBlockers) {
+          if (distSqToSegment(x, y, s.ax, s.ay, s.bx, s.by) < s.half * s.half) return true;
+        }
+        return false;
+      };
+
       const addSpot = (x: number, y: number, scaleBase = 1) => {
         if (spots.length >= MAX_TREES) return;
+        if (blocked(x, y)) return;
         spots.push({ x, z: -y, s: scaleBase * 1.25 * (0.75 + Math.random() * 0.7) });
       };
 
@@ -760,9 +799,21 @@ export default function CityViewer() {
       roads.forEach((road) => {
         if (!road.coordinates || road.coordinates.length < 2) return;
         if (!["primary", "secondary", "trunk", "tertiary"].includes(road.type)) return;
-        for (let i = 0; i < road.coordinates.length; i += 3) {
-          const pt = road.coordinates[i];
-          spots.push({ x: pt.x + (Math.random() - 0.5) * 4, z: -pt.y + (Math.random() - 0.5) * 4 });
+        if ((road.layer ?? 0) > 0 || road.bridge) return; // no ground lamps under the deck
+        // Lamps belong on the verge, not the carriageway: offset laterally
+        // past the road edge, alternating sides
+        const offset = roadWidth(road) / 2 + 1.3;
+        let side = 1;
+        for (let i = 0; i < road.coordinates.length - 1; i += 3) {
+          const p = road.coordinates[i], q = road.coordinates[i + 1];
+          const len = Math.hypot(q.x - p.x, q.y - p.y);
+          if (len < 0.5) continue;
+          const nx = -(q.y - p.y) / len, ny = (q.x - p.x) / len;
+          spots.push({
+            x: p.x + nx * offset * side + (Math.random() - 0.5) * 1.5,
+            z: -(p.y + ny * offset * side) + (Math.random() - 0.5) * 1.5,
+          });
+          side *= -1;
         }
       });
       if (!spots.length) return;
@@ -1103,6 +1154,47 @@ export default function CityViewer() {
       }
     };
 
+    // ─── Route glow line for the selected vehicle ───
+    let routeMesh: THREE.Mesh | null = null;
+    let routePollTimer: ReturnType<typeof setInterval> | null = null;
+
+    const clearRouteLine = () => {
+      if (routeMesh) { scene.remove(routeMesh); routeMesh.geometry.dispose(); routeMesh = null; }
+      if (routePollTimer) { clearInterval(routePollTimer); routePollTimer = null; }
+    };
+
+    const showRoute = (points: { x: number; y: number; h: number }[]) => {
+      if (routeMesh) { scene.remove(routeMesh); routeMesh.geometry.dispose(); routeMesh = null; }
+      if (points.length < 2) return;
+      const pts = points.map((p) => new THREE.Vector2(p.x, -p.y));
+      const heights = points.map((p) => p.h + 0.45);
+      const geo = buildRibbon(pts, 1.4, heights);
+      if (!geo) return;
+      routeMesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({
+        color: 0x35e0ff, transparent: true, opacity: 0.75, toneMapped: false,
+        blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide,
+      }));
+      routeMesh.renderOrder = 9;
+      scene.add(routeMesh);
+    };
+
+    // Programmatic selection (demos, tests): window.__cpSelect(vehicleId)
+    (window as unknown as { __cpSelect?: (id: number) => void }).__cpSelect = (id: number) => {
+      selectedVehicleIdRef.current = id;
+      startRoutePolling(id);
+    };
+
+    const startRoutePolling = (vehicleId: number) => {
+      clearRouteLine();
+      const ask = () => socketRef.current?.emit("get_route", { id: vehicleId });
+      ask();
+      // Refresh so the line trims as the vehicle advances and follows reroutes
+      routePollTimer = setInterval(() => {
+        if (selectedVehicleIdRef.current !== vehicleId) { clearRouteLine(); return; }
+        ask();
+      }, 2000);
+    };
+
     // ─── Incident injection: click a road to close/reopen it ───
     const roadsData: Road[] = [];
     const closedOverlays = new Map<number, THREE.Mesh>();
@@ -1176,11 +1268,13 @@ export default function CityViewer() {
           const vid = type ? instanceIds[type][vHit.instanceId] : undefined;
           if (vid !== undefined) {
             selectedVehicleIdRef.current = vid;
+            startRoutePolling(vid);
             return;
           }
         }
         selectedVehicleIdRef.current = null;
         setSelectedVehicle(null);
+        clearRouteLine();
 
         // Closing a road is destructive — require Shift+click so vehicle
         // selection misses don't take out half the network
@@ -1198,6 +1292,12 @@ export default function CityViewer() {
 
       socket.on("road_state", (data: { road_id: number; closed: boolean }) => {
         setRoadOverlay(data.road_id, data.closed);
+      });
+
+      socket.on("vehicle_route", (data: { id: number; points: { x: number; y: number; h: number }[] }) => {
+        if (data.id !== selectedVehicleIdRef.current) return;
+        if (!data.points.length) { clearRouteLine(); return; } // vehicle finished
+        showRoute(data.points);
       });
 
       socket.on("traffic_update", (data) => {
@@ -1569,6 +1669,7 @@ export default function CityViewer() {
     return () => {
       window.removeEventListener("resize", onResize);
       cancelAnimationFrame(animationFrameId);
+      clearRouteLine();
       socketRef.current?.disconnect();
       trafficLightMeshesRef.current.clear();
       vehiclesMapRef.current.clear();
