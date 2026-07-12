@@ -37,6 +37,9 @@ export default function CityViewer() {
   const selectedVehicleIdRef = useRef<number | null>(null);
   const [history, setHistory] = useState<{ health: number; flow: number }[]>([]);
   const historyPrevRef = useRef<number>(0);
+  const minimapRef = useRef<HTMLCanvasElement>(null);
+  const [cineMode, setCineMode] = useState<number>(0); // 0 off, 1 orbit, 2 flyover
+  const cineRef = useRef(0);
 
   // Modes (URL params allow deep-linking a mode, e.g. ?night=1&rain=1)
   const [isNight, setIsNight] = useState<boolean>(false);
@@ -67,6 +70,7 @@ export default function CityViewer() {
 
   const trafficLightMeshesRef = useRef<Map<string, THREE.Mesh>>(new Map());
 
+  useEffect(() => { cineRef.current = cineMode; }, [cineMode]);
   useEffect(() => { isNightRef.current = isNight; }, [isNight]);
   useEffect(() => { isRainingRef.current = isRaining; }, [isRaining]);
   useEffect(() => { demoRef.current = viewMode === "demo"; }, [viewMode]);
@@ -120,6 +124,7 @@ export default function CityViewer() {
     const instanceIds: Record<VehicleType, number[]> = { car: [], bus: [], auto: [], bike: [], truck: [] };
     const headlightMeshes = {} as Record<VehicleType, THREE.InstancedMesh>;
     const taillightMeshes = {} as Record<VehicleType, THREE.InstancedMesh>;
+    const beamMeshes = {} as Record<VehicleType, THREE.InstancedMesh>;
     const MAX_INSTANCES = 600;
     const dummy = new THREE.Object3D();
 
@@ -219,12 +224,36 @@ export default function CityViewer() {
     };
 
     // ─── Buildings: clay low-rise + glass towers, merged ───
-    const createBuildings = (buildings: Building[]) => {
+    const SHOP_COLORS = ["#c94f3d", "#3d7a5a", "#33619e", "#c9913d", "#7a4f8f", "#a83a5c"];
+
+    const createBuildings = (buildings: Building[], roads: Road[]) => {
       const clayGeoms: THREE.BufferGeometry[] = [];
       const glassGeoms: THREE.BufferGeometry[] = [];
       const edgeGeoms: THREE.BufferGeometry[] = [];
       const clutterMatrices: THREE.Matrix4[] = [];
+      // Shopfront quads: positions + per-vertex colors, merged into one mesh
+      const shopPos: number[] = [];
+      const shopCol: number[] = [];
+      const shopIdx: number[] = [];
+      let shopQuads = 0;
 
+      // Market streets: walls near these get street-level shopfronts
+      const shopSegs: { ax: number; ay: number; bx: number; by: number }[] = [];
+      roads.forEach((r) => {
+        if (!r.coordinates || !["primary", "secondary", "tertiary"].includes(r.type)) return;
+        if ((r.layer ?? 0) > 0 || r.bridge) return;
+        for (let i = 0; i < r.coordinates.length - 1; i++) {
+          shopSegs.push({ ax: r.coordinates[i].x, ay: r.coordinates[i].y, bx: r.coordinates[i + 1].x, by: r.coordinates[i + 1].y });
+        }
+      });
+      const nearShopStreet = (x: number, y: number, maxD: number) => {
+        for (const s of shopSegs) {
+          if (distSqToSegment(x, y, s.ax, s.ay, s.bx, s.by) < maxD * maxD) return { ax: s.ax, ay: s.ay, bx: s.bx, by: s.by };
+        }
+        return null;
+      };
+
+      const tint = new THREE.Color();
       buildings.forEach((b) => {
         if (!b.coordinates || b.coordinates.length < 3) return;
         // OSM often lacks height data — fall back to a varied 6-15m (deterministic per id)
@@ -243,13 +272,58 @@ export default function CityViewer() {
         if (height >= 30) {
           glassGeoms.push(geom);
         } else {
+          // Per-building facade tint (deterministic): warm whites, creams,
+          // pale ochres, dusty pinks — taller buildings slightly cooler
+          tint.setHSL(
+            0.06 + ((b.id % 13) / 13) * 0.08,
+            0.10 + ((b.id % 7) / 7) * 0.18,
+            0.78 + ((b.id % 5) / 5) * 0.10 - (height > 18 ? 0.05 : 0)
+          );
+          const vc = geom.attributes.position.count;
+          const colArr = new Float32Array(vc * 3);
+          for (let i = 0; i < vc; i++) {
+            colArr[i * 3] = tint.r; colArr[i * 3 + 1] = tint.g; colArr[i * 3 + 2] = tint.b;
+          }
+          geom.setAttribute("color", new THREE.BufferAttribute(colArr, 3));
           clayGeoms.push(geom);
           edgeGeoms.push(new THREE.EdgesGeometry(geom, 30));
 
+          // Street-level shopfronts: walls that face a market street get
+          // colourful shop-unit strips (6 m units, alternating colours)
+          const n = b.coordinates.length;
+          for (let i = 0; i < n; i++) {
+            const p = b.coordinates[i], q = b.coordinates[(i + 1) % n];
+            const mx = (p.x + q.x) / 2, my = (p.y + q.y) / 2;
+            const seg = nearShopStreet(mx, my, 16);
+            if (!seg) continue;
+            const wallLen = Math.hypot(q.x - p.x, q.y - p.y);
+            if (wallLen < 4) continue;
+            const ux = (q.x - p.x) / wallLen, uy = (q.y - p.y) / wallLen;
+            // Outward = toward the street (z-fight offset applied along it)
+            let nx = -uy, ny = ux;
+            const toRoad = { x: (seg.ax + seg.bx) / 2 - mx, y: (seg.ay + seg.by) / 2 - my };
+            if (nx * toRoad.x + ny * toRoad.y < 0) { nx = -nx; ny = -ny; }
+            const units = Math.max(1, Math.floor(wallLen / 6));
+            const unitLen = wallLen / units;
+            for (let u = 0; u < units; u++) {
+              const c = new THREE.Color(SHOP_COLORS[(b.id + i + u) % SHOP_COLORS.length]);
+              const x0 = p.x + ux * (u * unitLen + 0.3) + nx * 0.08;
+              const y0 = p.y + uy * (u * unitLen + 0.3) + ny * 0.08;
+              const x1 = p.x + ux * ((u + 1) * unitLen - 0.3) + nx * 0.08;
+              const y1 = p.y + uy * ((u + 1) * unitLen - 0.3) + ny * 0.08;
+              const base = shopQuads * 4;
+              // three.js: (x, h, -y)
+              shopPos.push(x0, 0.25, -y0, x1, 0.25, -y1, x1, 3.0, -y1, x0, 3.0, -y0);
+              for (let k = 0; k < 4; k++) shopCol.push(c.r, c.g, c.b);
+              shopIdx.push(base, base + 1, base + 2, base, base + 2, base + 3);
+              shopQuads++;
+            }
+          }
+
           // Roof clutter: AC units / water tanks
           const c = polygonCentroid(b.coordinates);
-          const n = 1 + Math.floor(Math.random() * 3);
-          for (let k = 0; k < n; k++) {
+          const nClutter = 1 + Math.floor(Math.random() * 3);
+          for (let k = 0; k < nClutter; k++) {
             const m = new THREE.Matrix4();
             const s = 1.2 + Math.random() * 2.2;
             m.makeRotationY(Math.random() * Math.PI);
@@ -266,11 +340,22 @@ export default function CityViewer() {
 
       if (clayGeoms.length) {
         const merged = BufferGeometryUtils.mergeGeometries(clayGeoms);
-        const mat = new THREE.MeshStandardMaterial({ color: PALETTE.clay, roughness: 0.95, metalness: 0.0 });
+        // Facade tints ride in vertex colors; material color stays the
+        // day/night multiplier so the night lerp still works
+        const mat = new THREE.MeshStandardMaterial({ color: 0xffffff, vertexColors: true, roughness: 0.95, metalness: 0.0 });
         clayMesh = new THREE.Mesh(merged, mat);
         clayMesh.castShadow = true;
         clayMesh.receiveShadow = true;
         scene.add(clayMesh);
+      }
+      if (shopQuads) {
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute("position", new THREE.Float32BufferAttribute(shopPos, 3));
+        geo.setAttribute("color", new THREE.Float32BufferAttribute(shopCol, 3));
+        geo.setIndex(shopIdx);
+        geo.computeVertexNormals();
+        const mat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.85, side: THREE.DoubleSide });
+        scene.add(new THREE.Mesh(geo, mat));
       }
       if (glassGeoms.length) {
         const merged = BufferGeometryUtils.mergeGeometries(glassGeoms);
@@ -809,6 +894,41 @@ export default function CityViewer() {
     };
 
     // ─── Rain streaks ───
+    // Puddles: glossy dark discs scattered on ground roads, fade in with rain
+    let puddleMesh: THREE.Mesh | null = null;
+    const initPuddles = (roads: Road[]) => {
+      const geoms: THREE.BufferGeometry[] = [];
+      let seed = 7;
+      const rand = () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647; };
+      roads.forEach((r) => {
+        if (!r.coordinates || r.coordinates.length < 2) return;
+        if ((r.layer ?? 0) > 0 || r.bridge) return;
+        const w = roadWidth(r);
+        if (w < 6) return; // only wider roads collect visible puddles
+        for (let i = 0; i < r.coordinates.length - 1; i++) {
+          if (rand() > 0.16) continue;
+          const a = r.coordinates[i], b = r.coordinates[i + 1];
+          const t = rand();
+          const cx = a.x + (b.x - a.x) * t + (rand() - 0.5) * w * 0.5;
+          const cy = a.y + (b.y - a.y) * t + (rand() - 0.5) * w * 0.5;
+          const disc = new THREE.CircleGeometry(1.2 + rand() * 2.6, 10);
+          disc.rotateX(-Math.PI / 2);
+          disc.scale(1 + rand() * 0.8, 1, 0.6 + rand() * 0.5); // irregular
+          disc.translate(cx, 0.15, -cy);
+          geoms.push(disc);
+        }
+      });
+      if (!geoms.length) return;
+      const merged = BufferGeometryUtils.mergeGeometries(geoms);
+      const mat = new THREE.MeshStandardMaterial({
+        color: 0x2c3340, roughness: 0.05, metalness: 0.85,
+        transparent: true, opacity: 0,
+      });
+      puddleMesh = new THREE.Mesh(merged, mat);
+      puddleMesh.visible = false;
+      scene.add(puddleMesh);
+    };
+
     const initRain = () => {
       rainPositions = new Float32Array(RAIN_COUNT * 6);
       for (let i = 0; i < RAIN_COUNT; i++) {
@@ -860,20 +980,127 @@ export default function CityViewer() {
         scene.add(hl);
         headlightMeshes[type] = hl;
 
-        // Taillights: two red-orange boxes at the rear (-X)
+        // Headlight beam cone: apex at the lamp, widening 9m forward.
+        // Additive + no depth write so overlapping beams just brighten.
+        const beamGeo = new THREE.ConeGeometry(2.4, 9, 8, 1, true);
+        beamGeo.rotateZ(Math.PI / 2); // apex now points -X; base sits at +X
+        beamGeo.translate(l / 2 + 4.5, h * 0.4, 0);
+        const beamMat = new THREE.MeshBasicMaterial({
+          color: 0xfff2c0, transparent: true, opacity: 0.08,
+          blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide,
+        });
+        const beam = new THREE.InstancedMesh(beamGeo, beamMat, MAX_INSTANCES);
+        beam.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+        beam.count = 0;
+        beam.visible = false;
+        scene.add(beam);
+        beamMeshes[type] = beam;
+
+        // Taillights: two rear boxes. Per-instance colour doubles as the
+        // brake light — dull red normally, bright red under braking.
         const tlL = new THREE.BoxGeometry(0.55, 0.5, 0.65);
         tlL.translate(-l / 2, h * 0.45, w * 0.3);
         const tlR = new THREE.BoxGeometry(0.55, 0.5, 0.65);
         tlR.translate(-l / 2, h * 0.45, -w * 0.3);
         const tlGeo = BufferGeometryUtils.mergeGeometries([tlL, tlR]);
-        const tlMat = new THREE.MeshBasicMaterial({ color: 0xff5433, toneMapped: false });
+        const tlMat = new THREE.MeshBasicMaterial({ color: 0xffffff, toneMapped: false });
         const tl = new THREE.InstancedMesh(tlGeo, tlMat, MAX_INSTANCES);
         tl.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
         tl.count = 0;
-        tl.visible = false;
         scene.add(tl);
         taillightMeshes[type] = tl;
       });
+    };
+
+    // ─── Minimap: static road layer drawn once, live dots per frame ───
+    const MINI = 176;
+    let miniStatic: HTMLCanvasElement | null = null;
+    let miniScale = 1;
+    let miniToPx: ((x: number, z: number) => number[]) | null = null;
+    const buildMinimap = (roads: Road[]) => {
+      let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+      roads.forEach((r) => r.coordinates?.forEach((p) => {
+        minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x);
+        minZ = Math.min(minZ, -p.y); maxZ = Math.max(maxZ, -p.y);
+      }));
+      if (!isFinite(minX)) return;
+      miniScale = (MINI - 14) / Math.max(maxX - minX, maxZ - minZ);
+      // world (x, z) -> minimap px, centred
+      const wx0 = (minX + maxX) / 2, wz0 = (minZ + maxZ) / 2;
+      const toPx = (x: number, z: number) => [
+        (x - wx0) * miniScale + MINI / 2, (z - wz0) * miniScale + MINI / 2,
+      ];
+      miniToPx = toPx;
+      miniStatic = document.createElement("canvas");
+      miniStatic.width = miniStatic.height = MINI;
+      const c = miniStatic.getContext("2d")!;
+      c.fillStyle = "rgba(12, 14, 18, 0.85)";
+      c.fillRect(0, 0, MINI, MINI);
+      roads.forEach((r) => {
+        if (!r.coordinates || r.coordinates.length < 2) return;
+        const major = !["service", "residential", "unclassified", "living_street"].includes(r.type);
+        c.strokeStyle = (r.layer ?? 0) > 0 || r.bridge ? "#8d86a8" : major ? "#7c8088" : "#3c4048";
+        c.lineWidth = major ? 1.6 : 0.7;
+        c.beginPath();
+        r.coordinates.forEach((p, i) => {
+          const [px, py] = toPx(p.x, -p.y);
+          if (i === 0) c.moveTo(px, py); else c.lineTo(px, py);
+        });
+        c.stroke();
+      });
+    };
+
+    const drawMinimap = () => {
+      const canvas = minimapRef.current;
+      const toPx = miniToPx;
+      if (!canvas || !miniStatic || !toPx) return;
+      const c = canvas.getContext("2d")!;
+      c.clearRect(0, 0, MINI, MINI);
+      c.drawImage(miniStatic, 0, 0);
+      // vehicles
+      c.fillStyle = "#f2c12e";
+      vehiclesMapRef.current.forEach((v) => {
+        const [px, py] = toPx(v.currentX, v.currentZ);
+        c.fillRect(px - 1, py - 1, 2, 2);
+      });
+      // camera: position dot + view direction wedge
+      const [cx2, cy2] = toPx(camera.position.x, camera.position.z);
+      const az = controls.getAzimuthalAngle();
+      c.save();
+      c.translate(cx2, cy2);
+      c.rotate(-az);
+      c.fillStyle = "rgba(120, 200, 255, 0.35)";
+      c.beginPath(); c.moveTo(0, 0); c.lineTo(-7, -14); c.lineTo(7, -14); c.closePath(); c.fill();
+      c.fillStyle = "#7cc8ff";
+      c.beginPath(); c.arc(0, 0, 2.4, 0, Math.PI * 2); c.fill();
+      c.restore();
+    };
+
+    // ─── Cinematic camera paths (photo mode) ───
+    const cinePaths: { curve: THREE.CatmullRomCurve3; look: "center" | "ahead"; speed: number }[] = [];
+    const buildCinePaths = (roads: Road[]) => {
+      // Path 1: sweeping orbit of the circle at varying height
+      const orbitPts: THREE.Vector3[] = [];
+      const R = 150;
+      for (let i = 0; i < 8; i++) {
+        const a = (i / 8) * Math.PI * 2;
+        const h = [30, 52, 34, 72, 38, 60, 30, 46][i];
+        orbitPts.push(new THREE.Vector3(Math.cos(a) * R, h, Math.sin(a) * R));
+      }
+      cinePaths.push({ curve: new THREE.CatmullRomCurve3(orbitPts, true), look: "center", speed: 0.012 });
+
+      // Path 2: fly along the elevated corridor deck
+      const elevated = roads
+        .filter((r) => ((r.layer ?? 0) > 0 || r.bridge) && r.coordinates?.length > 8)
+        .sort((a, b) => b.coordinates.length - a.coordinates.length)[0];
+      if (elevated) {
+        const pts = elevated.coordinates
+          .filter((_, i) => i % 3 === 0)
+          .map((p) => new THREE.Vector3(p.x, 14, -p.y));
+        if (pts.length >= 4) {
+          cinePaths.push({ curve: new THREE.CatmullRomCurve3(pts, false), look: "ahead", speed: 0.02 });
+        }
+      }
     };
 
     // ─── Incident injection: click a road to close/reopen it ───
@@ -1062,6 +1289,8 @@ export default function CityViewer() {
           const tx = ox, ty = v.z ?? 0, tz = -oy, ta = v.angle;
           const existing = vMap.get(v.id);
           if (existing) {
+            // Brake lights: decelerating noticeably, or crawling in a queue
+            existing.braking = v.speed < existing.speed - 1.5 || v.speed < 2;
             existing.targetX = tx; existing.targetY = ty; existing.targetZ = tz;
             existing.targetAngle = ta; existing.speed = v.speed;
           } else {
@@ -1087,7 +1316,7 @@ export default function CityViewer() {
         createRoads(data.roads);
         // Drop OSM footprints that overlap road ribbons (mapping noise)
         const cleanBuildings = filterBuildingsOffRoads(data.buildings, data.roads);
-        createBuildings(cleanBuildings);
+        createBuildings(cleanBuildings, data.roads);
         createWindows(cleanBuildings);
         const parkInfo = createGreens(data.greens || []);
         createTrees(data, parkInfo);
@@ -1096,6 +1325,9 @@ export default function CityViewer() {
         createLabels(data);
         roadsData.push(...data.roads);
         initRoadPicking();
+        initPuddles(data.roads);
+        buildMinimap(data.roads);
+        buildCinePaths(data.roads);
         initRain();
         initVehicles();
         initWebSocket();
@@ -1134,21 +1366,35 @@ export default function CityViewer() {
       const dt = Math.min(clockRef.current.getDelta(), 0.1);
       const t = clockRef.current.elapsedTime;
 
-      // Revolve buttons override; DEMO mode slow-orbits on its own
-      if (orbitDirRef.current !== 0) {
+      // Cinematic camera path overrides everything else
+      const cine = cineRef.current > 0 ? cinePaths[cineRef.current - 1] : null;
+      if (cine) {
+        const u = (t * cine.speed) % 1;
+        camera.position.copy(cine.curve.getPointAt(u));
+        if (cine.look === "center") camera.lookAt(0, 8, 0);
+        else {
+          const ahead = cine.curve.getPointAt(Math.min(u + 0.04, 1));
+          camera.lookAt(ahead.x, ahead.y - 2, ahead.z);
+        }
+      } else if (orbitDirRef.current !== 0) {
+        // Revolve buttons override; DEMO mode slow-orbits on its own
         controls.autoRotate = true;
         controls.autoRotateSpeed = orbitDirRef.current * 3.2;
+        controls.update();
       } else {
         controls.autoRotate = demoRef.current;
         controls.autoRotateSpeed = 0.8;
+        controls.update();
       }
-      controls.update();
 
       const night = isNightRef.current;
       const raining = isRainingRef.current;
       // First frames snap to the active mode (deep links); afterwards smooth transition
       frameCount++;
       const F = frameCount < 8 ? 1 : 0.045;
+
+      // Minimap refresh (~10 Hz is plenty)
+      if (frameCount % 6 === 0) drawMinimap();
 
       // Label declutter: fade sprites out beyond their tier's view distance
       if (frameCount % 6 === 0 && labelSprites.length) {
@@ -1176,7 +1422,8 @@ export default function CityViewer() {
 
       // Materials day ↔ night
       if (groundMesh) lerpMatColor(groundMesh.material as THREE.Material, PALETTE.ground, PALETTE.groundNight, night, F);
-      if (clayMesh) lerpMatColor(clayMesh.material as THREE.Material, PALETTE.clay, PALETTE.clayNight, night, F);
+      // Clay facades are vertex-coloured; the material colour is a pure multiplier
+      if (clayMesh) lerpMatColor(clayMesh.material as THREE.Material, 0xffffff, PALETTE.clayNight, night, F);
       if (glassMesh) lerpMatColor(glassMesh.material as THREE.Material, PALETTE.glass, PALETTE.glassNight, night, F);
       if (clayEdges) {
         (clayEdges.material as THREE.LineBasicMaterial).color.lerp(
@@ -1206,6 +1453,18 @@ export default function CityViewer() {
         const m = lampGlow.material as THREE.MeshBasicMaterial;
         m.opacity += ((night ? 1 : 0) - m.opacity) * F;
         lampGlow.visible = m.opacity > 0.03;
+      }
+
+      // Wet weather surfaces: asphalt turns glossy, puddles fade in
+      asphaltMeshes.forEach((m) => {
+        const mat = m.material as THREE.MeshStandardMaterial;
+        mat.roughness += ((raining ? 0.35 : 0.95) - mat.roughness) * F;
+        mat.metalness += ((raining ? 0.35 : 0.0) - mat.metalness) * F;
+      });
+      if (puddleMesh) {
+        const m = puddleMesh.material as THREE.MeshStandardMaterial;
+        m.opacity += ((raining ? 0.85 : 0) - m.opacity) * F;
+        puddleMesh.visible = m.opacity > 0.03;
       }
 
       // Rain
@@ -1263,9 +1522,13 @@ export default function CityViewer() {
         const palette = VEHICLE_COLORS[type];
         bodyMeshes[type].setColorAt(idx, getColor(palette[v.id % palette.length]));
 
+        // Taillights double as brake lights — always rendered
+        taillightMeshes[type].setMatrixAt(idx, dummy.matrix);
+        taillightMeshes[type].setColorAt(
+          idx, getColor(v.braking ? "#ff2418" : night ? "#c03d26" : "#571510"));
         if (night) {
           headlightMeshes[type].setMatrixAt(idx, dummy.matrix);
-          taillightMeshes[type].setMatrixAt(idx, dummy.matrix);
+          beamMeshes[type].setMatrixAt(idx, dummy.matrix);
         }
         counts[type]++;
       });
@@ -1276,12 +1539,15 @@ export default function CityViewer() {
         body.instanceMatrix.needsUpdate = true;
         if (body.instanceColor) body.instanceColor.needsUpdate = true;
 
-        const hl = headlightMeshes[type], tl = taillightMeshes[type];
-        hl.visible = night; tl.visible = night;
+        const hl = headlightMeshes[type], tl = taillightMeshes[type], beam = beamMeshes[type];
+        hl.visible = night; beam.visible = night;
+        tl.count = counts[type];
+        tl.instanceMatrix.needsUpdate = true;
+        if (tl.instanceColor) tl.instanceColor.needsUpdate = true;
         if (night) {
-          hl.count = counts[type]; tl.count = counts[type];
+          hl.count = counts[type]; beam.count = counts[type];
           hl.instanceMatrix.needsUpdate = true;
-          tl.instanceMatrix.needsUpdate = true;
+          beam.instanceMatrix.needsUpdate = true;
         }
       });
 
@@ -1493,6 +1759,14 @@ export default function CityViewer() {
             </div>
           </div>
 
+          {/* ── Minimap ── */}
+          <canvas
+            ref={minimapRef}
+            width={176}
+            height={176}
+            className="absolute top-16 right-4 rounded border border-white/15 pointer-events-none"
+          />
+
           {/* ── Selected vehicle card ── */}
           {selectedVehicle && (
             <div className="absolute bottom-24 right-4 pointer-events-none bg-black/80 border border-amber-200/40 px-4 py-3 font-mono text-xs text-neutral-200">
@@ -1509,6 +1783,19 @@ export default function CityViewer() {
 
           {/* ── Revolve controls (hold to orbit) ── */}
           <div className="absolute bottom-8 right-8 z-40 flex items-center gap-2 select-none">
+            <button
+              type="button"
+              onClick={() => setCineMode((c) => (c + 1) % 3)}
+              className={`px-3 py-1.5 font-mono text-xs tracking-widest border ${
+                cineMode > 0
+                  ? "bg-[#2a2030]/90 border-fuchsia-300/60 text-fuchsia-100"
+                  : "bg-[#16171b]/80 border-white/10 text-neutral-400 hover:text-neutral-200"
+              }`}
+              title="Cinematic camera: off / orbit / flyover"
+            >
+              🎥 {cineMode === 0 ? "CINE" : cineMode === 1 ? "ORBIT" : "FLYOVER"}
+            </button>
+            <div className="w-px h-5 bg-white/10 mx-1" />
             <button
               type="button"
               onPointerDown={() => { orbitDirRef.current = -1; }}

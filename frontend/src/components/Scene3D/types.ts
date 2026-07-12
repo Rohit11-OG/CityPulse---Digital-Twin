@@ -28,7 +28,7 @@ export interface SocketVehicle {
 export interface TrafficLightData { x: number; y: number; state: string; }
 
 export interface ClientVehicle {
-  id: number; type: string; speed: number;
+  id: number; type: string; speed: number; braking?: boolean;
   currentX: number; currentY: number; currentZ: number; currentAngle: number;
   targetX: number; targetY: number; targetZ: number; targetAngle: number;
 }
