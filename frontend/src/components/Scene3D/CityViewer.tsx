@@ -41,6 +41,33 @@ export default function CityViewer() {
   const [cineMode, setCineMode] = useState<number>(0); // 0 off, 1 orbit, 2 flyover
   const cineRef = useRef(0);
 
+  // AI analyst chat
+  const [aiOpen, setAiOpen] = useState(false);
+  const [aiInput, setAiInput] = useState("");
+  const [aiBusy, setAiBusy] = useState(false);
+  const [aiMsgs, setAiMsgs] = useState<{ role: "user" | "ai"; text: string; actions?: { tool: string; summary: Record<string, unknown> }[] }[]>([]);
+
+  const askTwin = async () => {
+    const q = aiInput.trim();
+    if (!q || aiBusy) return;
+    setAiInput("");
+    setAiMsgs((m) => [...m, { role: "user", text: q }]);
+    setAiBusy(true);
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/ask`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question: q }),
+      });
+      const d = await res.json();
+      setAiMsgs((m) => [...m, { role: "ai", text: d.answer ?? "(no answer)", actions: d.actions }]);
+    } catch {
+      setAiMsgs((m) => [...m, { role: "ai", text: "Backend unreachable." }]);
+    } finally {
+      setAiBusy(false);
+    }
+  };
+
   // Modes (URL params allow deep-linking a mode, e.g. ?night=1&rain=1)
   const [isNight, setIsNight] = useState<boolean>(false);
   const [isRaining, setIsRaining] = useState<boolean>(false);
@@ -1857,6 +1884,58 @@ export default function CityViewer() {
             </div>
             <div className="text-[10px] font-mono tracking-[0.15em] text-neutral-500 mt-1">
               CLICK VEHICLE = INSPECT · SHIFT+CLICK ROAD = CLOSE / REOPEN
+            </div>
+          </div>
+
+          {/* ── AI analyst chat ── */}
+          <div className="absolute left-4 bottom-40 z-40 w-96 pointer-events-auto font-mono">
+            {aiOpen && (
+              <div className="bg-black/85 border border-cyan-300/30 mb-2 max-h-72 overflow-y-auto p-3 space-y-2 text-xs">
+                {aiMsgs.length === 0 && (
+                  <div className="text-neutral-500">
+                    Ask the twin — e.g. &quot;what happens if Bhabha Nagar Road closes?&quot; or
+                    &quot;summarize current traffic&quot;. The AI can run experiments on the live sim.
+                  </div>
+                )}
+                {aiMsgs.map((m, i) => (
+                  <div key={i}>
+                    <span className={m.role === "user" ? "text-amber-200" : "text-cyan-200"}>
+                      {m.role === "user" ? "YOU " : "TWIN "}
+                    </span>
+                    <span className="text-neutral-200 whitespace-pre-wrap">{m.text}</span>
+                    {m.actions && m.actions.length > 0 && (
+                      <div className="text-[10px] text-fuchsia-300/80 mt-0.5">
+                        {m.actions.map((a, j) => (
+                          <div key={j}>⚙ {a.tool} {JSON.stringify(a.summary)}</div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ))}
+                {aiBusy && <div className="text-cyan-400 animate-pulse">TWIN thinking / experimenting…</div>}
+              </div>
+            )}
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => setAiOpen((o) => !o)}
+                className={`px-3 py-1.5 text-xs tracking-widest border ${
+                  aiOpen ? "bg-[#102a30]/90 border-cyan-300/60 text-cyan-100"
+                         : "bg-[#16171b]/80 border-white/10 text-neutral-400 hover:text-neutral-200"
+                }`}
+              >
+                ✦ ASK THE TWIN
+              </button>
+              {aiOpen && (
+                <input
+                  value={aiInput}
+                  onChange={(e) => setAiInput(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") askTwin(); }}
+                  placeholder={aiBusy ? "running…" : "ask about traffic…"}
+                  disabled={aiBusy}
+                  className="flex-1 bg-black/70 border border-white/15 px-3 py-1.5 text-xs text-neutral-100 outline-none focus:border-cyan-300/50"
+                />
+              )}
             </div>
           </div>
 

@@ -75,6 +75,15 @@ _scene_cache = None
 def read_root():
     return {"status": "ok", "message": "CityPulse Backend API is running."}
 
+@app.post("/api/ask")
+async def api_ask(payload: dict):
+    """AI city analyst: natural-language question -> answer (may run what-if tools)."""
+    question = (payload or {}).get("question", "").strip()
+    if not question:
+        return {"answer": "Ask a question about the traffic network.", "actions": []}
+    from ai_analyst import ask
+    return await ask(sim, question)
+
 @app.get("/api/scene")
 def get_scene():
     """Serves the downloaded and parsed road and building network data."""
