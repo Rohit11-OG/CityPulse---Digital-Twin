@@ -363,9 +363,10 @@ export default function CityViewer() {
             }
           }
 
-          // Roof clutter: AC units / water tanks
+          // Roof clutter: AC units / water tanks — but not under the flyover,
+          // where rooftop boxes poke up through the deck
           const c = polygonCentroid(b.coordinates);
-          const nClutter = 1 + Math.floor(Math.random() * 3);
+          const nClutter = underDeck(c.x, c.y) ? 0 : 1 + Math.floor(Math.random() * 3);
           for (let k = 0; k < nClutter; k++) {
             const m = new THREE.Matrix4();
             const s = 1.2 + Math.random() * 2.2;
@@ -1155,7 +1156,7 @@ export default function CityViewer() {
     };
 
     // ─── Cinematic camera paths (photo mode) ───
-    const cinePaths: { curve: THREE.CatmullRomCurve3; look: "center" | "ahead"; speed: number }[] = [];
+    const cinePaths: { curve: THREE.CatmullRomCurve3; look: "center" | "ahead"; speed: number; target?: THREE.CatmullRomCurve3 }[] = [];
     const buildCinePaths = (roads: Road[]) => {
       // Path 1: sweeping orbit of the circle at varying height
       const orbitPts: THREE.Vector3[] = [];
@@ -1167,16 +1168,23 @@ export default function CityViewer() {
       }
       cinePaths.push({ curve: new THREE.CatmullRomCurve3(orbitPts, true), look: "center", speed: 0.012 });
 
-      // Path 2: fly along the elevated corridor deck
+      // Path 2: chase-cam BESIDE the elevated corridor, looking at the deck.
+      // Flying on the centerline clips through towers built up against the
+      // highway; an offset side path keeps the camera in open air.
       const elevated = roads
         .filter((r) => ((r.layer ?? 0) > 0 || r.bridge) && r.coordinates?.length > 8)
         .sort((a, b) => b.coordinates.length - a.coordinates.length)[0];
       if (elevated) {
-        const pts = elevated.coordinates
-          .filter((_, i) => i % 3 === 0)
-          .map((p) => new THREE.Vector3(p.x, 14, -p.y));
-        if (pts.length >= 4) {
-          cinePaths.push({ curve: new THREE.CatmullRomCurve3(pts, false), look: "ahead", speed: 0.02 });
+        const sparse = elevated.coordinates.filter((_, i) => i % 3 === 0);
+        const flat = sparse.map((p) => new THREE.Vector2(p.x, -p.y));
+        const sidePts = offsetPolyline(flat, 16).map((v) => new THREE.Vector3(v.x, 18, v.y));
+        const deckPts = sparse.map((p) => new THREE.Vector3(p.x, 9, -p.y));
+        if (sidePts.length >= 4) {
+          cinePaths.push({
+            curve: new THREE.CatmullRomCurve3(sidePts, false),
+            target: new THREE.CatmullRomCurve3(deckPts, false),
+            look: "ahead", speed: 0.02,
+          });
         }
       }
     };
@@ -1498,9 +1506,11 @@ export default function CityViewer() {
       if (cine) {
         const u = (t * cine.speed) % 1;
         camera.position.copy(cine.curve.getPointAt(u));
-        if (cine.look === "center") camera.lookAt(0, 8, 0);
-        else {
-          const ahead = cine.curve.getPointAt(Math.min(u + 0.04, 1));
+        if (cine.look === "center") {
+          camera.lookAt(0, 8, 0);
+        } else {
+          const lookCurve = cine.target ?? cine.curve;
+          const ahead = lookCurve.getPointAt(Math.min(u + 0.04, 1));
           camera.lookAt(ahead.x, ahead.y - 2, ahead.z);
         }
       } else if (orbitDirRef.current !== 0) {

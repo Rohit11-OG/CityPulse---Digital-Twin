@@ -125,8 +125,11 @@ export function filterBuildingsOffRoads(buildings: Building[], roads: Road[]): B
 
   return buildings.filter((b) => {
     if (!b.coordinates || b.coordinates.length < 3) return false;
-    // Under the flyover only low structures survive; tall ones poke through the deck
-    const cullDeck = b.height > DECK_CLEARANCE;
+    // Effective RENDER height — must match createBuildings' fallback exactly,
+    // else 3.5m OSM defaults pass this check and then render 6-15m tall
+    // through the 8m deck
+    const renderHeight = b.height && b.height > 5 ? b.height : 6 + ((b.id % 97) / 97) * 9;
+    const cullDeck = renderHeight >= DECK_CLEARANCE;
     const c = polygonCentroid(b.coordinates);
     if (depthIn(groundSegs, c.x, c.y) > 0) return false;
     if (cullDeck && depthIn(deckSegs, c.x, c.y) > 0) return false;
