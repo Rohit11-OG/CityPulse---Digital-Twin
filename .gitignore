@@ -22,3 +22,6 @@ frontend/next-env.d.ts
 *.mp4
 .understand-anything/
 .DS_Store
+
+# runtime logs
+*.log
