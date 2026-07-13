@@ -8,7 +8,7 @@ backend/.venv/
 __pycache__/
 *.pyc
 
-# Generated map data
+# Generated map data (scene.json + osm_raw_*.json cache)
 backend/data/
 
 # Node / Next.js

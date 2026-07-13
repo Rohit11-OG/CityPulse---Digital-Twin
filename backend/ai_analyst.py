@@ -111,13 +111,20 @@ async def _run_tool(sim, name, args):
     return {"error": f"unknown tool {name}"}
 
 
-async def ask(sim, question):
-    """Agent loop: question -> (tool calls)* -> final answer."""
+async def ask(live_sim, question):
+    """Agent loop: question -> (tool calls)* -> final answer.
+
+    Experiments run on an isolated sandbox copy of the live simulation, so the
+    view other clients watch is never disturbed and concurrent questions can't
+    corrupt each other.
+    """
     api_key = os.environ.get("NVIDIA_API_KEY")
     if not api_key:
         return {"answer": "AI analyst is not configured: add NVIDIA_API_KEY to backend/.env "
                           "(get one free at build.nvidia.com) and restart the server.",
                 "actions": []}
+
+    sim = live_sim.clone_for_experiment()
 
     system = (
         "You are the traffic analyst embedded in a live digital twin of the Mumbai Naka "
@@ -125,15 +132,17 @@ async def ask(sim, question):
         "Mumbai-Agra Highway corridor passing over it, and surrounding arterials. The "
         "simulation is calibrated against live TomTom speeds. Traffic is Indian mixed "
         "traffic (~46% two-wheelers). One simulated vehicle represents 2.5 real vehicles.\n\n"
-        "You can run experiments with tools: close/reopen roads, fast-forward, and measure. "
-        "For what-if questions: record baseline state, make the change, fast_forward ~60s, "
-        "measure again, then ALWAYS reopen every road you closed BEFORE giving your final "
-        "answer — never leave the network modified, never ask permission to restore it. "
-        "Only leave a road closed when the user explicitly asked for a lasting closure. "
-        "Answer concisely with concrete numbers (before vs after). If asked something outside "
-        "traffic/city scope, decline briefly.\n\n"
+        "Your experiments run on a private sandbox copy of the current network — closing "
+        "roads and fast-forwarding here do NOT affect the live map.\n"
+        "CRITICAL: never invent or estimate numbers. For any what-if question you MUST use "
+        "the tools to get real measurements: call get_state for the baseline, toggle_road to "
+        "make the change, fast_forward with 60 seconds, then get_state again — only THEN give "
+        "your answer with the actual before/after numbers the tools returned. No need to reopen "
+        "the road afterwards (it's a sandbox). For a lasting change on the real network, tell "
+        "the user to shift+click the road on the map. Answer concisely. If asked something "
+        "outside traffic/city scope, decline briefly.\n\n"
         f"Major roads (road_id: name, class): {json.dumps(_major_roads(sim))}\n\n"
-        f"Live state now: {json.dumps(_snapshot(sim))}"
+        f"State now: {json.dumps(_snapshot(sim))}"
     )
     messages = [{"role": "system", "content": system},
                 {"role": "user", "content": str(question)[:2000]}]
@@ -149,11 +158,18 @@ async def ask(sim, question):
         )
 
     for _ in range(MAX_TOOL_ROUNDS):
-        resp = await asyncio.to_thread(call_nim)
+        try:
+            resp = await asyncio.to_thread(call_nim)
+        except requests.RequestException as e:
+            return {"answer": f"AI service unreachable or slow ({type(e).__name__}). "
+                              "The NVIDIA endpoint may be busy — try again.", "actions": actions}
         if resp.status_code != 200:
             return {"answer": f"AI backend error {resp.status_code}: {resp.text[:200]}",
                     "actions": actions}
-        msg = resp.json()["choices"][0]["message"]
+        try:
+            msg = resp.json()["choices"][0]["message"]
+        except (ValueError, KeyError, IndexError):
+            return {"answer": "AI returned an unexpected response format.", "actions": actions}
         messages.append(msg)
 
         tool_calls = msg.get("tool_calls")

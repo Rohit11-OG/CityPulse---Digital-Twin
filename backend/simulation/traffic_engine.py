@@ -1,6 +1,5 @@
 import json
 import math
-import heapq
 import random
 import time
 import asyncio
@@ -214,6 +213,44 @@ class TrafficSimulation:
 
         from simulation.live_traffic import LiveTrafficManager
         self.live_traffic = LiveTrafficManager()
+
+    def clone_for_experiment(self):
+        """
+        A throwaway copy for AI what-if experiments. Everything the experiment
+        mutates (graph, vehicles, closed roads, traffic-light phases, clock) is
+        deep-copied; read-only structures and the live TomTom/weather managers
+        are shared by reference. The live simulation other clients watch is
+        never touched.
+        """
+        import copy
+        c = TrafficSimulation.__new__(TrafficSimulation)
+        # Mutated during an experiment -> isolate
+        c.graph = copy.deepcopy(self.graph)
+        c.vehicles = copy.deepcopy(self.vehicles)
+        c.closed_roads = copy.deepcopy(self.closed_roads)
+        c.traffic_lights = copy.deepcopy(self.traffic_lights)
+        c.junction_crossings = list(self.junction_crossings)
+        # Read-only after init -> share
+        c.road_edges = self.road_edges
+        c.road_nodes = self.road_nodes
+        c.roundabout_nodes = self.roundabout_nodes
+        c.roundabout_edges = self.roundabout_edges
+        c.node_height = self.node_height
+        c.junction_set = self.junction_set
+        c.entry_gates = self.entry_gates
+        c.exit_gates = self.exit_gates
+        c.live_traffic = self.live_traffic
+        c.weather_manager = self.weather_manager
+        # Scalars
+        c.scene_path = self.scene_path
+        c.DECK_HEIGHT = self.DECK_HEIGHT
+        c.sim_time = self.sim_time
+        c.vehicle_id_counter = self.vehicle_id_counter
+        c.speed_mult = self.speed_mult
+        c.rain_factor = self.rain_factor
+        c.gap_scale = self.gap_scale
+        c.target_density = self.target_density
+        return c
 
     def load_graph_from_scene(self):
         """
@@ -640,8 +677,11 @@ class TrafficSimulation:
     ]
 
     def time_of_day_factor(self):
-        """Density multiplier for the current local (IST) hour."""
-        return self.HOURLY_DENSITY[time.localtime().tm_hour]
+        """Density multiplier for the current Nashik (IST) hour — pinned to
+        Asia/Kolkata so rush hours stay correct on UTC cloud deploys."""
+        from datetime import datetime, timezone, timedelta
+        ist_hour = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).hour
+        return self.HOURLY_DENSITY[ist_hour]
 
     def toggle_road(self, road_id):
         """

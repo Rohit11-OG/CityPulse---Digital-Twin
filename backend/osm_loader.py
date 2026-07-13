@@ -234,7 +234,9 @@ def download_and_process_scene(lat, lon, radius=500, save_path=SCENE_PATH):
     Caches the raw Overpass response so the scene can be re-parsed
     (e.g. after parser changes) without re-downloading.
     """
-    raw_path = Path(save_path).parent / "osm_raw.json"
+    # Cache key includes location + radius, so changing CITY_LAT/LON/RADIUS in
+    # .env fetches fresh data instead of silently reusing the old area.
+    raw_path = Path(save_path).parent / f"osm_raw_{lat:.5f}_{lon:.5f}_{radius}.json"
     if raw_path.exists():
         print(f"Using cached raw OSM data from {raw_path} (delete it to force re-download).")
         with open(raw_path, "r") as f:

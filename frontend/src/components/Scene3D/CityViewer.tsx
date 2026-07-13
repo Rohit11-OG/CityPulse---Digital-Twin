@@ -1194,12 +1194,12 @@ export default function CityViewer() {
     let routePollTimer: ReturnType<typeof setInterval> | null = null;
 
     const clearRouteLine = () => {
-      if (routeMesh) { scene.remove(routeMesh); routeMesh.geometry.dispose(); routeMesh = null; }
+      if (routeMesh) { scene.remove(routeMesh); routeMesh.geometry.dispose(); (routeMesh.material as THREE.Material).dispose(); routeMesh = null; }
       if (routePollTimer) { clearInterval(routePollTimer); routePollTimer = null; }
     };
 
     const showRoute = (points: { x: number; y: number; h: number }[]) => {
-      if (routeMesh) { scene.remove(routeMesh); routeMesh.geometry.dispose(); routeMesh = null; }
+      if (routeMesh) { scene.remove(routeMesh); routeMesh.geometry.dispose(); (routeMesh.material as THREE.Material).dispose(); routeMesh = null; }
       if (points.length < 2) return;
       const pts = points.map((p) => new THREE.Vector2(p.x, -p.y));
       const heights = points.map((p) => p.h + 0.45);
@@ -1211,12 +1211,6 @@ export default function CityViewer() {
       }));
       routeMesh.renderOrder = 9;
       scene.add(routeMesh);
-    };
-
-    // Programmatic selection (demos, tests): window.__cpSelect(vehicleId)
-    (window as unknown as { __cpSelect?: (id: number) => void }).__cpSelect = (id: number) => {
-      selectedVehicleIdRef.current = id;
-      startRoutePolling(id);
     };
 
     const startRoutePolling = (vehicleId: number) => {
@@ -1253,7 +1247,12 @@ export default function CityViewer() {
     const setRoadOverlay = (roadId: number, closed: boolean) => {
       const existing = closedOverlays.get(roadId);
       if (!closed) {
-        if (existing) { scene.remove(existing); closedOverlays.delete(roadId); }
+        if (existing) {
+          scene.remove(existing);
+          existing.geometry.dispose();
+          (existing.material as THREE.Material).dispose();
+          closedOverlays.delete(roadId);
+        }
         return;
       }
       if (existing) return;
